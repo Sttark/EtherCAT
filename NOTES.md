@@ -1,6 +1,6 @@
-# Notes for EtherCAT V2 Implementation
+# EtherCAT Implementation Notes
 
-This document captures important learnings and requirements discovered during the development of the current EtherCAT implementation that should be incorporated into V2.
+This document captures important learnings and implementation details discovered during the development of the EtherCAT library.
 
 ---
 
@@ -30,7 +30,7 @@ if probe_key in self.network.pdo_offsets:
 self._probe_function = probe_value  # 0x0011 or 0x0021
 ```
 
-**Requirements for V2:**
+**Implementation Requirements:**
 1. Always write 0x0000 to disable probe before arming with new configuration
 2. Add 50ms delay after disable to allow drive firmware to process
 3. Stop cyclic task from maintaining old value during transition
