@@ -1,4 +1,4 @@
-# ethercat_v2 usage
+# EtherCAT Usage
 
 This document describes how to use and integrate the modular EtherCAT network manager and CiA 402 driver handles from another application.
 
@@ -11,7 +11,7 @@ This document describes how to use and integrate the modular EtherCAT network ma
 Use the typed configuration to describe your network and slaves.
 
 ```python
-from ethercat_v2.config_schema import EthercatNetworkConfig, DriveConfig, XmlConfig
+from ethercat.config_schema import EthercatNetworkConfig, DriveConfig, XmlConfig
 
 cfg = EthercatNetworkConfig(
     master_index=0,
@@ -30,8 +30,8 @@ cfg = EthercatNetworkConfig(
 
 ## Start network and create drive handle
 ```python
-from ethercat_v2.process_manager import EtherCATProcessManager
-from ethercat_v2.client import attach_drive_handle
+from ethercat.process_manager import EtherCATProcessManager
+from ethercat.client import attach_drive_handle
 
 mgr = EtherCATProcessManager(cfg)
 mgr.start()
