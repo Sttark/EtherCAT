@@ -1,6 +1,7 @@
 import logging
 import multiprocessing as mp
 import queue
+import signal
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -11,30 +12,56 @@ from .constants import (
     MODES_OP_INDEX, MODES_OP_DISPLAY_INDEX,
     TARGET_POSITION_INDEX, TARGET_VELOCITY_INDEX,
     POSITION_ACTUAL_INDEX, VELOCITY_ACTUAL_INDEX,
-    PROBE_FUNCTION_INDEX, PROBE_STATUS_INDEX, PROBE_POS1_INDEX, PROBE_POS2_INDEX, DIGITAL_INPUTS_INDEX,
-    MODE_PP, MODE_PV, MODE_CSP,
-    CW_BIT_NEW_SET_POINT, CW_ENABLE_OP_SIMPLIFIED,
+    PROBE_FUNCTION_INDEX, PROBE_STATUS_INDEX, PROBE_POS1_INDEX, PROBE_POS2_INDEX, PROBE_POS2_ALT_INDEX, DIGITAL_INPUTS_INDEX,
+    MODE_PP, MODE_PV, MODE_CSP, MODE_HM,
+    CW_BIT_NEW_SET_POINT, CW_BIT_CHANGE_IMMEDIATELY, CW_BIT_ABS_REL, CW_BIT_HALT, CW_ENABLE_OP_SIMPLIFIED,
     PROBE_FUNC_ENABLE_PROBE1, PROBE_FUNC_PROBE1_POS_EDGE, PROBE_FUNC_PROBE1_NEG_EDGE,
 )
 from .config_schema import EthercatNetworkConfig, DriveConfig
-from .master_adapter import Master as IGHMasterAdapter
-from .xml_decoder import parse_esi_features
+from .igh_master import Master
+from .xml_decoder import decode_esi
+from .ruckig_planner import RuckigCspPlanner, RuckigUnavailable
 
 
 logger = logging.getLogger(__name__)
 
+AL_STATE_OP = 0x08
+
 
 class EtherCATProcess:
+    def _install_signal_handlers(self) -> None:
+        """
+        Ensure SIGTERM/SIGINT (e.g., systemd stop) results in a graceful shutdown.
+
+        We translate signals into `stop_event.set()` so the cyclic loop exits and `_teardown()`
+        runs (releasing the EtherCAT master).
+        """
+        def _handler(signum, _frame):
+            try:
+                name = signal.Signals(signum).name
+            except Exception:
+                name = str(signum)
+            logger.info(f"Received {name} - stopping EtherCAT process gracefully...")
+            self.stop_event.set()
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(sig, _handler)
+            except Exception:
+                # Some environments may restrict signal handler installation.
+                pass
+
     """
     Isolated process that owns the EtherCAT master and cyclic loop.
     Communication via command/status queues. Non-blocking, resilient runtime.
     """
 
-    def __init__(self, cfg: EthercatNetworkConfig, cmd_q: mp.Queue, status_q: mp.Queue):
+    def __init__(self, cfg: EthercatNetworkConfig, cmd_q: mp.Queue, status_q: mp.Queue, stop_event: mp.Event):
         self.cfg = cfg
         self.cmd_q = cmd_q
         self.status_q = status_q
-        self.adapter = IGHMasterAdapter(master_index=cfg.master_index)
+        self.stop_event = stop_event
+        self.master = Master(master_index=cfg.master_index)
         self.domain = None
         self.slave_handles: Dict[int, Any] = {}
         self.offsets: Dict[int, Dict[Tuple[int, int], int]] = {}
@@ -45,16 +72,61 @@ class EtherCATProcess:
         self.warned_missing_pdo: Dict[int, set] = {}
         self.last_probe_arm: Dict[int, Optional[int]] = {}
         self.pdo_maps: Dict[int, Dict[str, Dict[int, list]]] = {}
+        # CiA 402 state machine tracking
+        self.enable_step: Dict[int, int] = {}  # Fault reset attempt counter
+        self.enable_last_action_ns: Dict[int, int] = {}  # Time-based enable pacing per slave
+        self.slave_in_op: Dict[int, bool] = {}  # Track which slaves reached OP
+        self.drive_enabled: Dict[int, bool] = {}  # Track which drives are enabled
+        self.desired_controlword: Dict[int, int] = {}  # Maintain controlword state per slave
+        self.cycle_count = 0  # Track cycles for OP detection
+        self.last_al_state: Dict[int, Optional[int]] = {}
+        # PP new-set-point pulse tracking (bit 4 behavior)
+        self._pp_pulse_active: Dict[int, bool] = {}
+        self._pp_pulse_start_ns: Dict[int, Optional[int]] = {}
+        self._pp_pulse_pending: Dict[int, bool] = {}
+        # If a new PP/HM strobe request arrives while bit 4 is still asserted, we force a one-cycle clear
+        # to guarantee a fresh 0→1 edge on the next cycle.
+        self._pp_force_clear_cycles: Dict[int, int] = {}
+        # PV optional set-point pulse (some drives require bit 4 toggle to latch new velocity)
+        self._pv_pulse_active: Dict[int, bool] = {}
+        self._pv_pulse_start_ns: Dict[int, Optional[int]] = {}
+        self._pv_pulse_pending: Dict[int, bool] = {}
+        self._pv_force_clear_cycles: Dict[int, int] = {}
+
+        # Manual enable/disable latch (DISABLE_DRIVE must suppress auto-enable)
+        self._enable_requested: Dict[int, bool] = {}
+        self._manual_disable: Dict[int, bool] = {}
+
+        # CSP atomic-swap targets (latest-wins, swapped at cycle boundary)
+        self._csp_target_next: Dict[int, Optional[int]] = {}
+        self._csp_target_cur: Dict[int, Optional[int]] = {}
+        # Default modes from config (if provided)
+        self._default_mode: Dict[int, Optional[int]] = {}
+        # OP timeout tracking
+        self._activated_mono_ns: Optional[int] = None
+
+        # Ruckig (optional CSP trajectory generation)
+        self._ruckig_planner: Optional[RuckigCspPlanner] = None
+        self._ruckig_requests: Dict[int, Dict[str, Any]] = {}  # slave_pos -> request dict
+        self._ruckig_last_error: Dict[int, Optional[str]] = {}
 
     def _setup(self) -> bool:
         # Open/request the master with or without PDO based on config
-        if not self.adapter.request(sdo_only=self.cfg.sdo_only):
+        if not self.master.request(
+            sdo_only=self.cfg.sdo_only,
+            force_release_device=bool(getattr(self.cfg, "force_release_master_on_startup", False)),
+            device_path=str(getattr(self.cfg, "ethercat_device_path", "/dev/EtherCAT0")),
+            sigterm_first=bool(getattr(self.cfg, "force_release_sigterm_first", True)),
+            retry_delay_s=float(getattr(self.cfg, "force_release_retry_delay_s", 1.0)),
+            force_release_attempts=int(getattr(self.cfg, "force_release_attempts", 3)),
+            force_release_debug_owners=bool(getattr(self.cfg, "force_release_debug_owners", True)),
+        ):
             logger.error("Failed to request master")
             return False
 
         # Create domain only if PDO is desired
         if not self.cfg.sdo_only:
-            self.domain = self.adapter.create_domain()
+            self.domain = self.master.create_domain()
 
         # Configure each slave
         for dcfg in self.cfg.slaves:
@@ -62,16 +134,26 @@ class EtherCATProcess:
                 logger.error(f"Slave {dcfg.position} missing vendor_id/product_code/xml")
                 return False
 
-            s = self.adapter.config_slave(dcfg.alias, dcfg.position, dcfg.vendor_id, dcfg.product_code)
+            s = self.master.config_slave(dcfg.alias, dcfg.position, dcfg.vendor_id, dcfg.product_code)
+            self.slave_handles[dcfg.position] = s
+            self._default_mode[dcfg.position] = dcfg.operation_mode
+            if dcfg.operation_mode is not None and dcfg.position not in self.last_mode_cmd:
+                # Seed desired mode so the process can behave deterministically even if the app never
+                # sends explicit mode commands (user-controlled: set operation_mode or send commands).
+                self.last_mode_cmd[dcfg.position] = int(dcfg.operation_mode)
 
-            # Build PDO config from XML + overrides
-            features = parse_esi_features(dcfg.xml.xml_file)
-            rx_pdos = dcfg.pdo.rx_pdos if dcfg.pdo and dcfg.pdo.rx_pdos else features['rx_pdos']
-            tx_pdos = dcfg.pdo.tx_pdos if dcfg.pdo and dcfg.pdo.tx_pdos else features['tx_pdos']
+            # Build PDO config from XML + overrides (device-scoped; avoids multi-Device mixing)
+            decoded = decode_esi(
+                dcfg.xml.xml_file,
+                vendor_id=dcfg.vendor_id,
+                product_code=dcfg.product_code,
+            )
+            rx_pdos = dcfg.pdo.rx_pdos if dcfg.pdo and dcfg.pdo.rx_pdos else decoded.rx_pdos
+            tx_pdos = dcfg.pdo.tx_pdos if dcfg.pdo and dcfg.pdo.tx_pdos else decoded.tx_pdos
 
             # Build per-PDO entry maps (by-the-book for ecrt_slave_config_pdos)
-            rx_pdo_map = features.get('pdo_map_rx', {})
-            tx_pdo_map = features.get('pdo_map_tx', {})
+            rx_pdo_map = decoded.pdo_map_rx
+            tx_pdo_map = decoded.pdo_map_tx
             if dcfg.pdo and dcfg.pdo.custom_pdo_config:
                 custom = dcfg.pdo.custom_pdo_config
                 # Assign all custom RX entries to the first RX PDO (common single-PDO pattern)
@@ -80,14 +162,41 @@ class EtherCATProcess:
                 if tx_pdos and custom.get('tx_entries'):
                     tx_pdo_map = {tx_pdos[0]: custom['tx_entries']}
 
+            # Compute supports from the *effective* PDO maps (XML + overrides), so the handle's
+            # capability checks match reality (especially important when custom PDOs add probe objects).
+            flat_rx = [e for entries in rx_pdo_map.values() for e in entries]
+            flat_tx = [e for entries in tx_pdo_map.values() for e in entries]
+            supports = dict(decoded.supports or {})
+            supports.update(
+                {
+                    "controlword": any(e[0] == CW_INDEX for e in flat_rx),
+                    "statusword": any(e[0] == SW_INDEX for e in flat_tx),
+                    "mode_command": any(e[0] == MODES_OP_INDEX for e in flat_rx),
+                    "mode_display": any(e[0] == MODES_OP_DISPLAY_INDEX for e in flat_tx),
+                    "touch_probe": any(
+                        e[0]
+                        in (
+                            PROBE_FUNCTION_INDEX,
+                            PROBE_STATUS_INDEX,
+                            PROBE_POS1_INDEX,
+                            PROBE_POS2_INDEX,
+                            PROBE_POS2_ALT_INDEX,
+                        )
+                        for e in (flat_rx + flat_tx)
+                    ),
+                }
+            )
+            if getattr(dcfg, "features_overrides", None):
+                supports.update(dcfg.features_overrides)
+
             sync_configs = []
             if rx_pdos:
-                sync_configs.append((2, 0, [(p, rx_pdo_map.get(p, [])) for p in rx_pdos]))
+                sync_configs.append((2, 1, [(p, rx_pdo_map.get(p, [])) for p in rx_pdos]))  # EC_DIR_OUTPUT
             if tx_pdos:
-                sync_configs.append((3, 1, [(p, tx_pdo_map.get(p, [])) for p in tx_pdos]))
+                sync_configs.append((3, 2, [(p, tx_pdo_map.get(p, [])) for p in tx_pdos]))  # EC_DIR_INPUT
 
             if not self.cfg.sdo_only:
-                self.adapter.configure_slave_pdos(s, sync_configs)
+                self.master.configure_slave_pdos(s, sync_configs)
 
                 # Bulk register PDO entries to obtain domain offsets (flatten per-PDO maps)
                 register_pairs = []
@@ -96,7 +205,7 @@ class EtherCATProcess:
                 for p, entries in tx_pdo_map.items():
                     register_pairs.extend([(idx, sub) for (idx, sub, _bits) in entries])
                 register_list = list(set(register_pairs))
-                offsets = self.adapter.register_pdo_entry_list(
+                offsets = self.master.register_pdo_entry_list(
                     self.domain, dcfg.alias, dcfg.position, dcfg.vendor_id, dcfg.product_code, register_list
                 )
                 self.offsets[dcfg.position] = offsets
@@ -106,20 +215,96 @@ class EtherCATProcess:
                 }
 
             # Track features for this slave
-            self.features[dcfg.position] = features['supports']
+            self.features[dcfg.position] = supports
+            # Enable intent defaults: auto-enable unless explicitly disabled
+            self._enable_requested.setdefault(dcfg.position, True)
+            self._manual_disable.setdefault(dcfg.position, False)
+            
+            # Configure DC (Distributed Clocks) if enabled
+            if dcfg.enable_dc and not self.cfg.sdo_only:
+                # Use cycle time from network config
+                cycle_time_ns = int(self.cfg.cycle_time_ms * 1_000_000)  # Convert ms to ns
+                
+                # Use configured DC values or defaults
+                dc_assign = dcfg.dc_assign_activate if dcfg.dc_assign_activate is not None else 0x0300
+                sync0_shift = dcfg.dc_sync0_shift_ns
+                sync1_cycle = dcfg.dc_sync1_cycle_time_ns
+                sync1_shift = dcfg.dc_sync1_shift_ns
+                
+                logger.info(f"Configuring DC for slave {dcfg.position}...")
+                logger.info(f"  Cycle time: {self.cfg.cycle_time_ms}ms = {cycle_time_ns}ns")
+                logger.info(f"  DC assign_activate: 0x{dc_assign:04X}")
+                
+                s.config_dc(
+                    assign_activate=dc_assign,
+                    sync0_cycle_time_ns=cycle_time_ns,
+                    sync0_shift_ns=sync0_shift,
+                    sync1_cycle_time_ns=sync1_cycle,
+                    sync1_shift_ns=sync1_shift
+                )
+                logger.info(f"✓ DC configured for slave {dcfg.position}")
+
+        # Initialize Ruckig planner if any drive enables it in config
+        if any(bool(getattr(d, "ruckig", None) and getattr(d.ruckig, "enabled", False)) for d in self.cfg.slaves):
+            self._ruckig_planner = RuckigCspPlanner()
+            if not self._ruckig_planner.available():
+                logger.warning("Ruckig is enabled in config but the `ruckig` package is not available in this process.")
 
         if not self.cfg.sdo_only:
-            self.adapter.activate()
+            # PDO mode correctness gate: 0x6040/0x6041 must be mapped for every slave in PDO mode.
+            # Without these, OP detection and CiA402 enable state machine are unsafe/undefined.
+            for dcfg in self.cfg.slaves:
+                entries = self.offsets.get(dcfg.position, {})
+                missing = []
+                if (CW_INDEX, 0) not in entries:
+                    missing.append(f"0x{CW_INDEX:04X}:0 (controlword)")
+                if (SW_INDEX, 0) not in entries:
+                    missing.append(f"0x{SW_INDEX:04X}:0 (statusword)")
+                if missing:
+                    raise RuntimeError(
+                        f"PDO mode requires 0x6040/0x6041 mapped. Slave {dcfg.position} is missing: {', '.join(missing)}"
+                    )
+
+            # Select DC reference clock (use first DC-enabled slave)
+            for dcfg in self.cfg.slaves:
+                if dcfg.enable_dc:
+                    s = self.slave_handles.get(dcfg.position)
+                    if s:
+                        self.master.select_reference_clock(s)
+                        logger.info(f"Selected slave {dcfg.position} as DC reference clock")
+                        break
+            
+            # Set initial application time BEFORE activation (critical for DC slaves)
+            initial_time_ns = int(time.time() * 1_000_000_000)
+            try:
+                self.master.set_application_time(initial_time_ns)
+                logger.info(f"Set initial DC application time: {initial_time_ns} ns")
+            except Exception as e:
+                logger.warning(f"Could not set application time: {e}")
+            
+            self.master.activate()
+            logger.info("Master activated - slave will reach OP state in cyclic loop")
+            self._activated_mono_ns = time.monotonic_ns()
+            
+            # Initialize OP tracking for all slaves
+            for dcfg in self.cfg.slaves:
+                self.slave_in_op[dcfg.position] = False
+                self.last_al_state[dcfg.position] = None
+                self._pp_pulse_active[dcfg.position] = False
+                self._pp_pulse_start_ns[dcfg.position] = None
+                self._pp_pulse_pending[dcfg.position] = False
+                self.enable_last_action_ns[dcfg.position] = 0
+                self.enable_step[dcfg.position] = 0
 
         return True
 
     def _teardown(self):
         try:
-            self.adapter.deactivate()
+            self.master.deactivate()
         except Exception:
             pass
         try:
-            self.adapter.release()
+            self.master.release()
         except Exception:
             pass
 
@@ -133,28 +318,85 @@ class EtherCATProcess:
             self.last_mode_cmd[cmd.target_id] = MODE_CSP
         elif cmd.type == CommandType.SET_VELOCITY:
             self.last_velocity_cmd[cmd.target_id] = float(cmd.value or 0.0)
+            # If this drive requires a set-point pulse to latch PV targets, schedule it.
+            dcfg = next((d for d in self.cfg.slaves if d.position == cmd.target_id), None)
+            if dcfg and getattr(dcfg, 'pv_requires_setpoint_toggle', False):
+                # If a pulse is already active, force a one-cycle clear to guarantee a fresh edge.
+                if self._pv_pulse_active.get(cmd.target_id, False):
+                    self._pv_force_clear_cycles[cmd.target_id] = 1
+                self._pv_pulse_pending[cmd.target_id] = True
         elif cmd.type in (CommandType.SET_POSITION, CommandType.SET_POSITION_CSP):
-            self.last_position_cmd[cmd.target_id] = float(cmd.value or 0.0)
+            if cmd.type == CommandType.SET_POSITION_CSP:
+                # CSP: do NOT mix with PP latching semantics; maintain a streaming target (atomic swap per cycle).
+                self._csp_target_next[cmd.target_id] = int(float(cmd.value or 0.0))
+                # Manual CSP streaming overrides any internal trajectory generator for safety.
+                self._ruckig_requests.pop(cmd.target_id, None)
+                if self._ruckig_planner:
+                    self._ruckig_planner.stop(cmd.target_id)
+            else:
+                # PP: store target and generate a "new set-point" pulse (controlword bit 4) to latch it.
+                self.last_position_cmd[cmd.target_id] = float(cmd.value or 0.0)
+                # If a pulse is already active, force a one-cycle clear so the next cycle has a clean 0→1 edge.
+                if self._pp_pulse_active.get(cmd.target_id, False):
+                    self._pp_force_clear_cycles[cmd.target_id] = 1
+                self._pp_pulse_pending[cmd.target_id] = True
         elif cmd.type == CommandType.START_HOMING:
             # Switch to HM mode and issue one-cycle start
             self.last_mode_cmd[cmd.target_id] = MODE_HM
             # Reuse position strobe to trigger new-set-point in HM
             self.last_position_cmd[cmd.target_id] = float(0)
+            # CiA402 homing start is typically triggered by controlword bit 4 in HM mode.
+            if self._pp_pulse_active.get(cmd.target_id, False):
+                self._pp_force_clear_cycles[cmd.target_id] = 1
+            self._pp_pulse_pending[cmd.target_id] = True
         elif cmd.type == CommandType.ARM_PROBE:
             probe_value = cmd.params.get('probe_function') if cmd.params else None
             if probe_value is not None:
                 self.last_probe_arm[cmd.target_id] = int(probe_value)
         elif cmd.type == CommandType.STOP_MOTION:
             self.last_velocity_cmd[cmd.target_id] = 0.0
+            # Stop any internal trajectory as well.
+            self._ruckig_requests.pop(cmd.target_id, None)
+            if self._ruckig_planner:
+                self._ruckig_planner.stop(cmd.target_id)
+        elif cmd.type == CommandType.START_RUCKIG_POSITION:
+            # Force CSP when starting Ruckig motion
+            self.last_mode_cmd[cmd.target_id] = MODE_CSP
+            self._ruckig_requests[cmd.target_id] = {
+                "kind": "position",
+                "target": int(float(cmd.value or 0.0)),
+                "params": cmd.params or {},
+            }
+        elif cmd.type == CommandType.START_RUCKIG_VELOCITY:
+            self.last_mode_cmd[cmd.target_id] = MODE_CSP
+            self._ruckig_requests[cmd.target_id] = {
+                "kind": "velocity",
+                "target": float(cmd.value or 0.0),
+                "params": cmd.params or {},
+            }
+        elif cmd.type == CommandType.STOP_RUCKIG:
+            self._ruckig_requests.pop(cmd.target_id, None)
+            if self._ruckig_planner:
+                self._ruckig_planner.stop(cmd.target_id)
         elif cmd.type == CommandType.DISABLE_PROBE:
             # Clear probe function on device (will be applied once in cyclic)
             self.last_probe_arm[cmd.target_id] = 0
         elif cmd.type == CommandType.ENABLE_DRIVE:
-            # Controlword bits handled in cyclic writer
-            pass
+            self._manual_disable[cmd.target_id] = False
+            self._enable_requested[cmd.target_id] = True
         elif cmd.type == CommandType.DISABLE_DRIVE:
-            # Controlword bits handled in cyclic writer
-            pass
+            self._manual_disable[cmd.target_id] = True
+            self._enable_requested[cmd.target_id] = False
+            # Force the state machine back toward disabled
+            self.desired_controlword[cmd.target_id] = 0x0000  # Disable voltage
+            self.drive_enabled[cmd.target_id] = False
+            # Clear any in-flight pulses (must re-strobe after re-enable)
+            self._pp_pulse_active[cmd.target_id] = False
+            self._pp_pulse_start_ns[cmd.target_id] = None
+            self._pp_pulse_pending[cmd.target_id] = False
+            self._pv_pulse_active[cmd.target_id] = False
+            self._pv_pulse_start_ns[cmd.target_id] = None
+            self._pv_pulse_pending[cmd.target_id] = False
         elif cmd.type == CommandType.READ_SDO:
             # Future: perform immediate SDO read and publish asynchronously
             pass
@@ -162,6 +404,163 @@ class EtherCATProcess:
             # Future: perform immediate SDO write
             pass
 
+    def _check_op_state(self):
+        """
+        Legacy OP detection fallback: detect OP by observing statusword != 0.
+        Prefer AL state via master.get_slave_info() (checked every cycle).
+        """
+        # Only check every 100 cycles after 100 cycles minimum
+        if self.cycle_count < 100 or self.cycle_count % 100 != 0:
+            return
+        
+        for slave_pos, entries in self.offsets.items():
+            # Skip if already detected as OP
+            if self.slave_in_op.get(slave_pos, False):
+                continue
+            
+            # Check statusword
+            if (SW_INDEX, 0) not in entries:
+                continue
+            
+            raw_sw = self.master.read_domain(self.domain, entries[(SW_INDEX, 0)], 2)
+            if not raw_sw:
+                continue
+            
+            statusword = int.from_bytes(raw_sw, 'little')
+            if statusword != 0:
+                self.slave_in_op[slave_pos] = True
+                logger.info(f"✓ Slave {slave_pos} reached OP state after {self.cycle_count} cycles "
+                          f"({self.cycle_count * self.cfg.cycle_time_ms / 1000:.1f}s) - statusword: 0x{statusword:04X}")
+    
+    def _update_al_states(self):
+        """
+        Update OP tracking using IgH-provided AL state. This runs every PDO cycle and also
+        detects when a slave falls OUT of OP.
+        """
+        for dcfg in self.cfg.slaves:
+            pos = dcfg.position
+            info = None
+            try:
+                info = self.master.get_slave_info(pos)
+            except Exception:
+                info = None
+
+            if not info or 'al_state' not in info:
+                # No AL state available; keep existing values (fallback statusword-based detector may still flip OP true).
+                continue
+
+            al_state = int(info.get('al_state', 0))
+            prev = self.last_al_state.get(pos)
+            self.last_al_state[pos] = al_state
+
+            in_op_now = (al_state == AL_STATE_OP)
+            in_op_prev = bool(self.slave_in_op.get(pos, False))
+
+            if in_op_now and not in_op_prev:
+                self.slave_in_op[pos] = True
+                logger.info(f"✓ Slave {pos} entered OP (AL state {al_state})")
+            elif (not in_op_now) and in_op_prev:
+                # Falling out of OP: immediately mark not enabled so we stop issuing motion-related handshakes.
+                self.slave_in_op[pos] = False
+                if self.drive_enabled.get(pos, False):
+                    logger.warning(f"⚠️ Slave {pos} left OP (AL state {al_state}) - disabling drive state until OP returns")
+                self.drive_enabled[pos] = False
+                # Clear state machine intent; it will re-run once OP returns.
+                self.desired_controlword.pop(pos, None)
+                # Clear PP pulse state; must re-issue a fresh pulse after OP returns.
+                self._pp_pulse_active[pos] = False
+                self._pp_pulse_start_ns[pos] = None
+                self._pp_pulse_pending[pos] = False
+
+    def _auto_enable_drives(self):
+        """
+        Automatic CiA 402 state machine - enables drives through state transitions.
+        Called every cycle to monitor and transition drives to Operation Enabled.
+        Only runs AFTER slave has reached OP state.
+        """
+        period_ns = int(max(self.cfg.enable_transition_period_ms, 1.0) * 1_000_000)
+        now_ns = time.monotonic_ns()
+
+        for slave_pos, entries in self.offsets.items():
+            # Only enable if slave is in OP
+            if not self.slave_in_op.get(slave_pos, False):
+                continue
+            # Manual disable must suppress auto-enable.
+            if self._manual_disable.get(slave_pos, False) or not self._enable_requested.get(slave_pos, True):
+                # Keep drive disabled and avoid advancing state machine.
+                self.desired_controlword[slave_pos] = 0x0000  # Disable voltage
+                self.drive_enabled[slave_pos] = False
+                continue
+            # Time-based rate limiting (defaults to 100ms)
+            last_ns = self.enable_last_action_ns.get(slave_pos, 0)
+            if (now_ns - last_ns) < period_ns:
+                continue
+            
+            # Read statusword
+            if (SW_INDEX, 0) not in entries:
+                continue
+            
+            raw_sw = self.master.read_domain(self.domain, entries[(SW_INDEX, 0)], 2)
+            if not raw_sw:
+                continue
+            
+            statusword = int.from_bytes(raw_sw, 'little')
+            if statusword == 0:
+                continue
+            
+            # Decode CiA 402 state from statusword
+            # Check for FAULT first (bit 3 set)
+            if statusword & 0x0008:
+                # FAULT state - send fault reset
+                step = self.enable_step.get(slave_pos, 0)
+                if step < 10:  # Limit fault reset attempts
+                    # Set FAULT_RESET controlword
+                    self.desired_controlword[slave_pos] = 0x0080
+                    self.enable_step[slave_pos] = step + 1
+                    self.enable_last_action_ns[slave_pos] = now_ns
+                    if step == 0:  # Log once
+                        logger.info(f"Slave {slave_pos}: FAULT (0x{statusword:04X}) → sending FAULT_RESET")
+                continue  # Move to next slave
+            
+            # Determine current state using CiA 402 standard bit patterns
+            state_bits = statusword & 0x006F
+            
+            # Operation Enabled: xxxx xxxx x01x 0111
+            if state_bits == 0x0027:
+                # Already enabled - set controlword to maintain enabled state
+                self.desired_controlword[slave_pos] = 0x000F  # ENABLE_OPERATION
+                if not self.drive_enabled.get(slave_pos, False):
+                    self.drive_enabled[slave_pos] = True
+                    logger.info(f"✓ Slave {slave_pos}: ENABLED (0x{statusword:04X})")
+                    self.enable_step[slave_pos] = 0
+                self.enable_last_action_ns[slave_pos] = now_ns
+                continue  # Move to next slave
+            
+            # Switched On: xxxx xxxx x01x 0011
+            elif state_bits == 0x0023:
+                # Send ENABLE_OPERATION (0x000F)
+                self.desired_controlword[slave_pos] = 0x000F
+                self.enable_last_action_ns[slave_pos] = now_ns
+                logger.info(f"Slave {slave_pos}: SWITCHED_ON (0x{statusword:04X}) → ENABLE_OPERATION")
+            
+            # Ready to Switch On: xxxx xxxx x00x 0001
+            elif state_bits == 0x0021:
+                # Send SWITCH_ON (0x0007)
+                self.desired_controlword[slave_pos] = 0x0007
+                self.enable_last_action_ns[slave_pos] = now_ns
+                logger.info(f"Slave {slave_pos}: READY_TO_SWITCH_ON (0x{statusword:04X}) → SWITCH_ON")
+            
+            # Switch On Disabled: xxxx xxxx x1xx 0000
+            elif (statusword & 0x004F) == 0x0040:
+                # Send SHUTDOWN (0x0006)
+                self.desired_controlword[slave_pos] = 0x0006
+                self.enable_last_action_ns[slave_pos] = now_ns
+                logger.info(f"Slave {slave_pos}: SWITCH_ON_DISABLED (0x{statusword:04X}) → SHUTDOWN")
+            else:
+                # Unknown state - log for debugging
+                if self.cycle_count % 200 == 0:  # Log occasionally
+                    logger.warning(f"Slave {slave_pos}: Unknown state - statusword 0x{statusword:04X}, state_bits 0x{state_bits:04X}")
+    
     def _publish_status(self):
         status = NetworkStatus(drives={})
         status.timestamp_ns = int(time.time() * 1_000_000_000)
@@ -170,35 +569,60 @@ class EtherCATProcess:
         # Example: read back status fields when offsets known
         for slave_pos, entries in self.offsets.items():
             drive = {}
+            # Include OP state
+            drive['in_op'] = self.slave_in_op.get(slave_pos, False)
+            if self.last_al_state.get(slave_pos) is not None:
+                drive['al_state'] = self.last_al_state.get(slave_pos)
             if (SW_INDEX, 0) in entries:
-                raw = self.adapter.read_domain(self.domain, entries[(SW_INDEX, 0)], 2) or b"\x00\x00"
-                drive['statusword'] = int.from_bytes(raw, 'little')
+                raw = self.master.read_domain(self.domain, entries[(SW_INDEX, 0)], 2) or b"\x00\x00"
+                sw = int.from_bytes(raw, 'little')
+                drive['statusword'] = sw
+                # Derived semantics (no extra bus access)
+                state_bits = sw & 0x006F
+                drive['enabled'] = (state_bits == 0x0027) and not self._manual_disable.get(slave_pos, False)
+                drive['fault'] = bool(sw & 0x0008)
+                drive['warning'] = bool(sw & 0x0080)
+                drive['target_reached'] = bool(sw & 0x0400)
+                drive['internal_limit_active'] = bool(sw & 0x0800)
+                drive['setpoint_ack'] = bool(sw & 0x1000)
+                # Intent flags
+                drive['enable_requested'] = self._enable_requested.get(slave_pos, True)
+                drive['manual_disable'] = self._manual_disable.get(slave_pos, False)
             if (MODES_OP_DISPLAY_INDEX, 0) in entries:
-                raw = self.adapter.read_domain(self.domain, entries[(MODES_OP_DISPLAY_INDEX, 0)], 1) or b"\x00"
+                raw = self.master.read_domain(self.domain, entries[(MODES_OP_DISPLAY_INDEX, 0)], 1) or b"\x00"
                 drive['mode_display'] = raw[0]
             if (POSITION_ACTUAL_INDEX, 0) in entries:
-                raw = self.adapter.read_domain(self.domain, entries[(POSITION_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                raw = self.master.read_domain(self.domain, entries[(POSITION_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
                 drive['position_actual'] = int.from_bytes(raw, 'little', signed=True)
             if (VELOCITY_ACTUAL_INDEX, 0) in entries:
-                raw = self.adapter.read_domain(self.domain, entries[(VELOCITY_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                raw = self.master.read_domain(self.domain, entries[(VELOCITY_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
                 drive['velocity_actual'] = int.from_bytes(raw, 'little', signed=True)
 
             # Probe status
             if (PROBE_STATUS_INDEX, 0) in entries:
-                raw = self.adapter.read_domain(self.domain, entries[(PROBE_STATUS_INDEX, 0)], 2) or b"\x00\x00"
+                raw = self.master.read_domain(self.domain, entries[(PROBE_STATUS_INDEX, 0)], 2) or b"\x00\x00"
                 drive['probe_active'] = bool(int.from_bytes(raw, 'little') & 0x0001)
                 drive['probe_enabled'] = True
             if (PROBE_POS1_INDEX, 0) in entries:
-                raw = self.adapter.read_domain(self.domain, entries[(PROBE_POS1_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                raw = self.master.read_domain(self.domain, entries[(PROBE_POS1_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
                 drive['probe_pos1'] = int.from_bytes(raw, 'little', signed=True)
             if (PROBE_POS2_INDEX, 0) in entries:
-                raw = self.adapter.read_domain(self.domain, entries[(PROBE_POS2_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                raw = self.master.read_domain(self.domain, entries[(PROBE_POS2_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                drive['probe_pos2'] = int.from_bytes(raw, 'little', signed=True)
+            elif (PROBE_POS2_ALT_INDEX, 0) in entries:
+                # Some devices map Probe-2 position at 0x60BB instead of 0x60BC.
+                raw = self.master.read_domain(self.domain, entries[(PROBE_POS2_ALT_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
                 drive['probe_pos2'] = int.from_bytes(raw, 'little', signed=True)
             if (DIGITAL_INPUTS_INDEX, 0) in entries:
-                raw = self.adapter.read_domain(self.domain, entries[(DIGITAL_INPUTS_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                raw = self.master.read_domain(self.domain, entries[(DIGITAL_INPUTS_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
                 drive['digital_inputs'] = int.from_bytes(raw, 'little')
             # Publish static feature capabilities (from XML-derived supports)
             drive['features'] = self.features.get(slave_pos, {})
+            # Publish Ruckig planner state
+            if self._ruckig_planner is not None:
+                r = self._ruckig_planner.describe(slave_pos)
+                r["last_error"] = self._ruckig_last_error.get(slave_pos)
+                drive["ruckig"] = r
             # Publish PDO map health (presence)
             pdo_health = {}
             for key_idx in [MODES_OP_INDEX, MODES_OP_DISPLAY_INDEX, CW_INDEX, SW_INDEX, TARGET_VELOCITY_INDEX, TARGET_POSITION_INDEX]:
@@ -224,11 +648,18 @@ class EtherCATProcess:
         # Example offsets lookup (to be set during registration step):
         # offsets[slave_pos][(index, subindex)] -> byte_offset
         for slave_pos, entries in self.offsets.items():
+            # Pre-read statusword when needed (PP ack/clear and enable state machine already requires it).
+            statusword = None
+            if (SW_INDEX, 0) in entries:
+                raw_sw = self.master.read_domain(self.domain, entries[(SW_INDEX, 0)], 2)
+                if raw_sw:
+                    statusword = int.from_bytes(raw_sw, 'little')
+
             # Maintain operation mode (0x6060) if mapped and requested
             mode = self.last_mode_cmd.get(slave_pos)
             if mode is not None:
                 if (MODES_OP_INDEX, 0) in entries:
-                    self.adapter.write_domain(self.domain, entries[(MODES_OP_INDEX, 0)], bytes([mode]))
+                    self.master.write_domain(self.domain, entries[(MODES_OP_INDEX, 0)], bytes([mode]))
                 else:
                     # Fallback to SDO and warn once
                     warned = self.warned_missing_pdo.setdefault(slave_pos, set())
@@ -237,16 +668,20 @@ class EtherCATProcess:
                         logger.warning(f"Slave {slave_pos}: {hex(MODES_OP_INDEX)} not in PDO; writing via SDO")
                         warned.add(key)
                     try:
-                        self.adapter.sdo_download(slave_pos, MODES_OP_INDEX, 0, bytes([mode]))
+                        self.master.sdo_download(slave_pos, MODES_OP_INDEX, 0, bytes([mode]))
                     except Exception as e:
                         logger.error(f"SDO write {hex(MODES_OP_INDEX)} failed: {e}")
 
+            # Safety: do not write motion targets until drive is enabled.
+            # Some drives fault (e.g., following error / excessive reference) if targets stream before enable.
+            motion_ok = self.drive_enabled.get(slave_pos, False) and not self._manual_disable.get(slave_pos, False)
+
             # Maintain target velocity (0x60FF) for PV
             vel = self.last_velocity_cmd.get(slave_pos)
-            if vel is not None:
+            if motion_ok and vel is not None:
                 v = int(vel)
                 if (TARGET_VELOCITY_INDEX, 0) in entries:
-                    self.adapter.write_domain(self.domain, entries[(TARGET_VELOCITY_INDEX, 0)], v.to_bytes(4, byteorder='little', signed=True))
+                    self.master.write_domain(self.domain, entries[(TARGET_VELOCITY_INDEX, 0)], v.to_bytes(4, byteorder='little', signed=True))
                 else:
                     warned = self.warned_missing_pdo.setdefault(slave_pos, set())
                     key = (TARGET_VELOCITY_INDEX, 0)
@@ -254,16 +689,31 @@ class EtherCATProcess:
                         logger.warning(f"Slave {slave_pos}: {hex(TARGET_VELOCITY_INDEX)} not in PDO; writing via SDO")
                         warned.add(key)
                     try:
-                        self.adapter.sdo_download(slave_pos, TARGET_VELOCITY_INDEX, 0, v.to_bytes(4, 'little', signed=True))
+                        self.master.sdo_download(slave_pos, TARGET_VELOCITY_INDEX, 0, v.to_bytes(4, 'little', signed=True))
                     except Exception as e:
                         logger.error(f"SDO write {hex(TARGET_VELOCITY_INDEX)} failed: {e}")
+                # PV pulse is "edge-ish": if we asserted bit4 at least once, clear pending so it becomes
+                # a bounded pulse (active clears on ack/timeout). This prevents indefinite re-triggering.
+                if self._pv_pulse_pending.get(slave_pos, False) and self._pv_pulse_active.get(slave_pos, False):
+                    self._pv_pulse_pending[slave_pos] = False
 
-            # Maintain target position (0x607A) for PP and CSP
-            pos = self.last_position_cmd.get(slave_pos)
-            if pos is not None:
+            # Maintain target position (0x607A)
+            # - PP/HM: write the last commanded target (latch with bit4 pulse below)
+            # - CSP: stream the buffered position every cycle (atomic swap)
+            pos = None
+            mode_eff = mode if mode is not None else self._default_mode.get(slave_pos)
+            if mode_eff == MODE_CSP:
+                # Atomic swap: update current target at cycle boundary if a new one arrived
+                if slave_pos in self._csp_target_next:
+                    self._csp_target_cur[slave_pos] = self._csp_target_next.get(slave_pos)
+                pos = self._csp_target_cur.get(slave_pos)
+            else:
+                pos = self.last_position_cmd.get(slave_pos)
+
+            if motion_ok and pos is not None:
                 p = int(pos)
                 if (TARGET_POSITION_INDEX, 0) in entries:
-                    self.adapter.write_domain(self.domain, entries[(TARGET_POSITION_INDEX, 0)], p.to_bytes(4, byteorder='little', signed=True))
+                    self.master.write_domain(self.domain, entries[(TARGET_POSITION_INDEX, 0)], p.to_bytes(4, byteorder='little', signed=True))
                 else:
                     warned = self.warned_missing_pdo.setdefault(slave_pos, set())
                     key = (TARGET_POSITION_INDEX, 0)
@@ -271,26 +721,109 @@ class EtherCATProcess:
                         logger.warning(f"Slave {slave_pos}: {hex(TARGET_POSITION_INDEX)} not in PDO; writing via SDO")
                         warned.add(key)
                     try:
-                        self.adapter.sdo_download(slave_pos, TARGET_POSITION_INDEX, 0, p.to_bytes(4, 'little', signed=True))
+                        self.master.sdo_download(slave_pos, TARGET_POSITION_INDEX, 0, p.to_bytes(4, 'little', signed=True))
                     except Exception as e:
                         logger.error(f"SDO write {hex(TARGET_POSITION_INDEX)} failed: {e}")
 
             # Controlword bit maintenance (0x6040):
-            # - PP: pulse bit 4 (new set-point) when position target changes
-            # - PV: ensure enable operation and appropriate state bits
+            # Build controlword from desired state machine value + motion bits
+            # CRITICAL: Must write EVERY cycle or slave may ignore commands
             if (CW_INDEX, 0) in entries:
                 cw_offset = entries[(CW_INDEX, 0)]
-                cw = 0
-                cw |= CW_ENABLE_OP_SIMPLIFIED
-                if pos is not None:
-                    cw |= (1 << CW_BIT_NEW_SET_POINT)
-                self.adapter.write_domain(self.domain, cw_offset, cw.to_bytes(2, byteorder='little'))
+                
+                # Start with state machine controlword (or default to enabled if already enabled)
+                if slave_pos in self.desired_controlword:
+                    cw = self.desired_controlword[slave_pos]
+                elif self.drive_enabled.get(slave_pos, False):
+                    # Drive is enabled - use ENABLE_OPERATION as base
+                    cw = CW_ENABLE_OP_SIMPLIFIED
+                else:
+                    # Not enabled yet and no state machine command - skip this cycle
+                    cw = None
+                
+                # Write controlword if we have one
+                if cw is not None:
+                    # --- CiA402 controlword behavior by mode ---
+                    # PV / Profile Torque / CSP style modes: continuous targets, no PP strobe.
+                    # PP: strobe bit 4 ("new set-point") as a pulse, then clear on ack/timeout.
+                    is_enabled = self.drive_enabled.get(slave_pos, False)
+                    mode_eff = mode_eff
+
+                    # Default: clear HALT so it doesn't linger across moves
+                    cw &= ~(1 << CW_BIT_HALT)
+
+                    # Update/clear PP pulse state (only after we've asserted bit 4 at least once).
+                    if self._pp_pulse_active.get(slave_pos, False):
+                        ack_mask = int(self.cfg.pp_ack_mask)
+                        timeout_ns = int(max(self.cfg.pp_ack_timeout_ms, 1.0) * 1_000_000)
+                        start_ns = self._pp_pulse_start_ns.get(slave_pos) or 0
+                        now_ns = time.monotonic_ns()
+                        acked = bool(statusword is not None and (statusword & ack_mask))
+                        timed_out = (now_ns - start_ns) >= timeout_ns
+                        if acked or timed_out:
+                            # Stop asserting bit 4 from this cycle onward.
+                            self._pp_pulse_active[slave_pos] = False
+                            self._pp_pulse_start_ns[slave_pos] = None
+                            self._pp_pulse_pending[slave_pos] = False
+
+                    # Update/clear PV pulse state (optional; mirrors PP ack/timeout semantics).
+                    if self._pv_pulse_active.get(slave_pos, False):
+                        ack_mask = int(self.cfg.pp_ack_mask)
+                        timeout_ns = int(max(self.cfg.pp_ack_timeout_ms, 1.0) * 1_000_000)
+                        start_ns = self._pv_pulse_start_ns.get(slave_pos) or 0
+                        now_ns = time.monotonic_ns()
+                        acked = bool(statusword is not None and (statusword & ack_mask))
+                        timed_out = (now_ns - start_ns) >= timeout_ns
+                        if acked or timed_out:
+                            self._pv_pulse_active[slave_pos] = False
+                            self._pv_pulse_start_ns[slave_pos] = None
+                            self._pv_pulse_pending[slave_pos] = False
+
+                    # Assert bit 4 only when a pulse is pending/active and a strobe-driven mode is selected.
+                    # CiA402: PP uses bit 4 "new set-point". HM commonly uses bit 4 as the homing start trigger.
+                    if is_enabled and (mode_eff in (MODE_PP, MODE_HM)):
+                        # Absolute/relative semantics: default to ABSOLUTE for PP (bit6=0).
+                        if mode_eff == MODE_PP:
+                            cw &= ~(1 << CW_BIT_ABS_REL)  # absolute
+                            cw |= (1 << CW_BIT_CHANGE_IMMEDIATELY)
+
+                        # Force-clear cycle to guarantee a fresh 0→1 edge if a new command arrived mid-pulse.
+                        fc = int(self._pp_force_clear_cycles.get(slave_pos, 0))
+                        if fc > 0:
+                            cw &= ~(1 << CW_BIT_NEW_SET_POINT)
+                            self._pp_force_clear_cycles[slave_pos] = fc - 1
+                        elif self._pp_pulse_pending.get(slave_pos, False) or self._pp_pulse_active.get(slave_pos, False):
+                            cw |= (1 << CW_BIT_NEW_SET_POINT)
+                            # Mark that we actually asserted bit 4 (required to later clear on ack/timeout).
+                            if not self._pp_pulse_active.get(slave_pos, False):
+                                self._pp_pulse_active[slave_pos] = True
+                                self._pp_pulse_start_ns[slave_pos] = time.monotonic_ns()
+                                # Pending is a one-shot request; once we've started the pulse, rely on
+                                # active+ack/timeout to clear it deterministically.
+                                self._pp_pulse_pending[slave_pos] = False
+
+                    # Optional PV set-point pulse behavior (device-specific)
+                    if is_enabled and (mode_eff == MODE_PV):
+                        dcfg = next((d for d in self.cfg.slaves if d.position == slave_pos), None)
+                        pv_requires = bool(dcfg and getattr(dcfg, 'pv_requires_setpoint_toggle', False))
+                        if pv_requires:
+                            fc = int(self._pv_force_clear_cycles.get(slave_pos, 0))
+                            if fc > 0:
+                                cw &= ~(1 << CW_BIT_NEW_SET_POINT)
+                                self._pv_force_clear_cycles[slave_pos] = fc - 1
+                            elif self._pv_pulse_pending.get(slave_pos, False) or self._pv_pulse_active.get(slave_pos, False):
+                                cw |= (1 << CW_BIT_NEW_SET_POINT)
+                                if not self._pv_pulse_active.get(slave_pos, False):
+                                    self._pv_pulse_active[slave_pos] = True
+                                    self._pv_pulse_start_ns[slave_pos] = time.monotonic_ns()
+                    
+                    self.master.write_domain(self.domain, cw_offset, cw.to_bytes(2, byteorder='little'))
 
             # Touch probe arming maintenance (write-once behavior)
             probe_val = self.last_probe_arm.get(slave_pos)
             if probe_val is not None:
                 if (PROBE_FUNCTION_INDEX, 0) in entries:
-                    self.adapter.write_domain(self.domain, entries[(PROBE_FUNCTION_INDEX, 0)], probe_val.to_bytes(2, 'little'))
+                    self.master.write_domain(self.domain, entries[(PROBE_FUNCTION_INDEX, 0)], probe_val.to_bytes(2, 'little'))
                 else:
                     warned = self.warned_missing_pdo.setdefault(slave_pos, set())
                     key = (PROBE_FUNCTION_INDEX, 0)
@@ -298,23 +831,135 @@ class EtherCATProcess:
                         logger.warning(f"Slave {slave_pos}: {hex(PROBE_FUNCTION_INDEX)} not in PDO; writing via SDO")
                         warned.add(key)
                     try:
-                        self.adapter.sdo_download(slave_pos, PROBE_FUNCTION_INDEX, 0, probe_val.to_bytes(2, 'little'))
+                        self.master.sdo_download(slave_pos, PROBE_FUNCTION_INDEX, 0, probe_val.to_bytes(2, 'little'))
                     except Exception as e:
                         logger.error(f"SDO write {hex(PROBE_FUNCTION_INDEX)} failed: {e}")
                 # Clear after one write
                 self.last_probe_arm[slave_pos] = None
 
+    def _update_ruckig(self) -> None:
+        """
+        If enabled and active, update Ruckig once per cycle and feed the CSP buffer (_csp_target_next).
+        """
+        if not self._ruckig_planner:
+            return
+        if self.cfg.sdo_only or self.domain is None:
+            return
+
+        dt_s_fallback = float(self.cfg.cycle_time_ms) / 1000.0
+
+        for dcfg in self.cfg.slaves:
+            pos = dcfg.position
+
+            # If no request and planner not active, skip
+            if pos not in self._ruckig_requests and not self._ruckig_planner.is_active(pos):
+                continue
+
+            # Safety: do not generate motion if not enabled
+            if not self.drive_enabled.get(pos, False) or self._manual_disable.get(pos, False):
+                continue
+
+            entries = self.offsets.get(pos, {})
+            if (POSITION_ACTUAL_INDEX, 0) not in entries:
+                self._ruckig_last_error[pos] = "Ruckig requires 0x6064 (position actual) mapped in PDO."
+                self._ruckig_requests.pop(pos, None)
+                self._ruckig_planner.stop(pos)
+                continue
+            if (VELOCITY_ACTUAL_INDEX, 0) not in entries:
+                self._ruckig_last_error[pos] = "Ruckig requires 0x606C (velocity actual) mapped in PDO."
+                self._ruckig_requests.pop(pos, None)
+                self._ruckig_planner.stop(pos)
+                continue
+
+            raw_p = self.master.read_domain(self.domain, entries[(POSITION_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+            raw_v = self.master.read_domain(self.domain, entries[(VELOCITY_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+            actual_position = int.from_bytes(raw_p, "little", signed=True)
+            actual_velocity = float(int.from_bytes(raw_v, "little", signed=True))
+
+            # Start request (initialize planner using measured actuals)
+            req = self._ruckig_requests.get(pos)
+            if req is not None:
+                cfg = getattr(dcfg, "ruckig", None)
+                if not cfg or not getattr(cfg, "enabled", False):
+                    self._ruckig_last_error[pos] = "Ruckig request rejected: DriveConfig.ruckig.enabled is False."
+                    self._ruckig_requests.pop(pos, None)
+                    self._ruckig_planner.stop(pos)
+                    continue
+
+                params = req.get("params") or {}
+                unit = (params.get("unit") or "native").lower()
+                if unit != "native":
+                    self._ruckig_last_error[pos] = "Ruckig currently supports only unit='native' (drive pulses)."
+                    self._ruckig_requests.pop(pos, None)
+                    self._ruckig_planner.stop(pos)
+                    continue
+
+                overrides = {
+                    "max_velocity": params.get("max_velocity"),
+                    "max_acceleration": params.get("max_acceleration"),
+                    "max_jerk": params.get("max_jerk"),
+                }
+
+                try:
+                    if req.get("kind") == "position":
+                        self._ruckig_planner.start_position(
+                            pos,
+                            actual_position=actual_position,
+                            actual_velocity=actual_velocity,
+                            target_position=int(req.get("target")),
+                            cfg=cfg,
+                            dt_s_fallback=dt_s_fallback,
+                            overrides=overrides,
+                        )
+                    else:
+                        self._ruckig_planner.start_velocity(
+                            pos,
+                            actual_position=actual_position,
+                            actual_velocity=actual_velocity,
+                            target_velocity=float(req.get("target")),
+                            cfg=cfg,
+                            dt_s_fallback=dt_s_fallback,
+                            overrides=overrides,
+                        )
+
+                    # Seed CSP buffer to measured position to prevent a step on the first cycle.
+                    self._csp_target_next[pos] = int(actual_position)
+                    self._csp_target_cur[pos] = int(actual_position)
+                    self._ruckig_last_error[pos] = None
+                except (RuckigUnavailable, ValueError) as e:
+                    self._ruckig_last_error[pos] = str(e)
+                    self._ruckig_planner.stop(pos)
+                finally:
+                    self._ruckig_requests.pop(pos, None)
+
+            # Step active planner
+            step = self._ruckig_planner.step(pos, actual_position=actual_position, actual_velocity=actual_velocity)
+            if step is not None:
+                self._csp_target_next[pos] = int(step.position)
+
     def run(self):
+        self._install_signal_handlers()
         ok = self._setup()
         if not ok:
             self._teardown()
-            return
+            raise SystemExit(1)
 
-        cycle_time_s = self.cfg.cycle_time_ms / 1000.0
+        cycle_ns = int(self.cfg.cycle_time_ms * 1_000_000)
+        if cycle_ns <= 0:
+            raise ValueError("cycle_time_ms must be > 0")
+
+        # Drift-correct cyclic schedule: base wall time to monotonic clock, then advance in fixed ns steps.
+        mono_base = time.monotonic_ns()
+        wall_base = time.time_ns()
+        next_cycle_mono = mono_base
+
         last_status = 0.0
-        last_cycle_start = time.time()
         try:
-            while True:
+            while not self.stop_event.is_set():
+                self.cycle_count += 1
+                next_cycle_mono += cycle_ns
+                scheduled_wall_ns = wall_base + (next_cycle_mono - mono_base)
+                
                 # Pump commands
                 for _ in range(16):
                     try:
@@ -325,30 +970,54 @@ class EtherCATProcess:
 
                 # Cyclic PDO exchange
                 if not self.cfg.sdo_only and self.domain is not None:
-                    # Maintain application/DC time if needed (optional)
+                    # Maintain application/DC time (aligned to cyclic schedule)
                     try:
-                        self.adapter.set_application_time(int(time.time() * 1_000_000_000))
+                        self.master.set_application_time(int(scheduled_wall_ns))
                     except Exception:
                         pass
-                    self.adapter.receive()
-                    self.adapter.process_domain(self.domain)
+
+                    self.master.receive()
+                    self.master.process_domain(self.domain)
+
+                    # Update OP state from AL state every cycle (and detect falling out of OP).
+                    self._update_al_states()
+                    # Fallback OP detection (statusword != 0) if AL state isn't available.
+                    self._check_op_state()
+
+                    # OP timeout guard (prevents infinite SAFEOP stalls)
+                    if self._activated_mono_ns is not None:
+                        elapsed_s = (time.monotonic_ns() - self._activated_mono_ns) / 1_000_000_000.0
+                        if elapsed_s >= float(self.cfg.op_timeout_s):
+                            not_op = [p for p in self.slave_in_op.keys() if not self.slave_in_op.get(p, False)]
+                            if not_op:
+                                states = {p: self.last_al_state.get(p) for p in not_op}
+                                raise RuntimeError(f"OP timeout after {self.cfg.op_timeout_s}s. Not in OP: {not_op}. AL states: {states}")
+
+                    # Run CiA 402 automatic enable state machine (only after OP)
+                    self._auto_enable_drives()
+                    # Update optional Ruckig trajectory generator (feeds CSP buffer)
+                    self._update_ruckig()
                     # Apply maintenance writes
                     self._cyclic_write()
-                    self.adapter.queue_domain(self.domain)
-                    self.adapter.send()
+                    self.master.queue_domain(self.domain)
+                    self.master.send()
 
                 # Periodic status publish (decouple from cycle rate)
                 now = time.time()
                 if now - last_status > 0.05:
-                    # compute last cycle time (rough)
-                    last_cycle_time_us = int((now - last_cycle_start) * 1_000_000)
-                    # Set temporary global last_cycle_time_us via NetworkStatus on publish call
-                    # (lightweight: attach to object just before publishing)
                     self._publish_status()
                     last_status = now
-                last_cycle_start = now
 
-                time.sleep(cycle_time_s)
+                # Sleep until scheduled next cycle (drift-correcting). If we fell behind badly, resync.
+                sleep_ns = next_cycle_mono - time.monotonic_ns()
+                if sleep_ns > 0:
+                    time.sleep(sleep_ns / 1_000_000_000.0)
+                else:
+                    # Overrun: if we're more than one cycle late, resync bases to avoid runaway drift.
+                    if sleep_ns < -cycle_ns:
+                        mono_base = time.monotonic_ns()
+                        wall_base = time.time_ns()
+                        next_cycle_mono = mono_base
         finally:
             self._teardown()
 
@@ -362,20 +1031,40 @@ class EtherCATProcessManager:
         self.cfg = cfg
         self._cmd_q: mp.Queue = mp.Queue(maxsize=1024)
         self._status_q: mp.Queue = mp.Queue(maxsize=64)
+        self._stop_event: mp.Event = mp.Event()
         self._proc: Optional[mp.Process] = None
 
     def start(self):
         if self._proc and self._proc.is_alive():
             return
-        target = EtherCATProcess(self.cfg, self._cmd_q, self._status_q)
-        self._proc = mp.Process(target=target.run, daemon=True)
+        self._stop_event.clear()
+        target = EtherCATProcess(self.cfg, self._cmd_q, self._status_q, self._stop_event)
+        self._proc = mp.Process(target=target.run, daemon=False)
         self._proc.start()
 
+    def is_alive(self) -> bool:
+        return bool(self._proc and self._proc.is_alive())
+
+    def exitcode(self) -> Optional[int]:
+        if not self._proc:
+            return None
+        return self._proc.exitcode
+
     def stop(self):
+        """Clean shutdown of the EtherCAT process"""
         if self._proc and self._proc.is_alive():
-            self._proc.terminate()
-            self._proc.join(timeout=2.0)
+            logger.info("Stopping EtherCAT process...")
+            # Signal the process to stop gracefully
+            self._stop_event.set()
+            # Wait for clean shutdown
+            self._proc.join(timeout=3.0)
+            # If still alive, force terminate as fallback
+            if self._proc.is_alive():
+                logger.warning("Process did not stop cleanly, terminating...")
+                self._proc.terminate()
+                self._proc.join(timeout=1.0)
             self._proc = None
+            logger.info("EtherCAT process stopped")
 
     # Application API
     def send_command(self, cmd: Command):

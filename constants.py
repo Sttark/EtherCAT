@@ -22,7 +22,10 @@ ERROR_CODE_INDEX = 0x603F
 PROBE_FUNCTION_INDEX = 0x60B8
 PROBE_STATUS_INDEX = 0x60B9
 PROBE_POS1_INDEX = 0x60BA
+# Note: some devices/ESIs use 0x60BB for the second captured position instead of 0x60BC.
+# The runtime supports both to avoid "silent" missing probe position reporting.
 PROBE_POS2_INDEX = 0x60BC
+PROBE_POS2_ALT_INDEX = 0x60BB
 DIGITAL_INPUTS_INDEX = 0x60FD
 
 # Modes of operation values (CiA 402)
@@ -37,9 +40,19 @@ MODE_CST = 10
 
 # Controlword bits/masks (simplified for maintenance)
 CW_BIT_NEW_SET_POINT = 4  # PP set-point bit (also used by some drives for homing start in MODE_HM)
+CW_BIT_CHANGE_IMMEDIATELY = 5  # PP: "change immediately"
+CW_BIT_ABS_REL = 6  # PP: 0=absolute, 1=relative
+CW_BIT_HALT = 8  # Halt (0x0100)
 
 # Commonly used masks for enabling operation (simplified sequence)
 CW_ENABLE_OP_SIMPLIFIED = 0x000F
+
+# Statusword bits (0x6041) - commonly used semantics
+SW_BIT_FAULT = 3
+SW_BIT_WARNING = 7
+SW_BIT_TARGET_REACHED = 10
+SW_BIT_INTERNAL_LIMIT_ACTIVE = 11
+SW_BIT_SETPOINT_ACK = 12  # commonly "set-point acknowledged" for PP/PV on many drives
 
 # Probe function bits (example for some drives)
 PROBE_FUNC_ENABLE_PROBE1 = 0x0001

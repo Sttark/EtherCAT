@@ -12,7 +12,8 @@ __all__ = [
     "config_schema",
     "commands",
     "status_model",
-    "master_adapter",
+    "igh_master",
+    "ruckig_planner",
 ]
 
 __version__ = "0.1.0"

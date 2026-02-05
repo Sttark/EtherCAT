@@ -68,6 +68,59 @@ class CiA402Drive:
         self._queue(CommandType.SET_POSITION_CSP, value=position, params={'unit': unit})
         return True
 
+    # Ruckig motion (CSP streaming inside process)
+    def ruckig_move_to(
+        self,
+        position: float,
+        *,
+        max_velocity: Optional[float] = None,
+        max_acceleration: Optional[float] = None,
+        max_jerk: Optional[float] = None,
+        unit: str = "native",
+    ) -> bool:
+        """
+        Start a jerk-limited (S-curve) point-to-point move using Ruckig, streaming 0x607A in CSP.
+        Limits may be omitted to use configured defaults in the process.
+        """
+        self._queue(
+            CommandType.START_RUCKIG_POSITION,
+            value=position,
+            params={
+                "unit": unit,
+                "max_velocity": max_velocity,
+                "max_acceleration": max_acceleration,
+                "max_jerk": max_jerk,
+            },
+        )
+        return True
+
+    def ruckig_set_velocity(
+        self,
+        velocity: float,
+        *,
+        max_acceleration: Optional[float] = None,
+        max_jerk: Optional[float] = None,
+        unit: str = "native",
+    ) -> bool:
+        """
+        Start/adjust a jerk-limited velocity command using Ruckig by streaming CSP position targets.
+        """
+        self._queue(
+            CommandType.START_RUCKIG_VELOCITY,
+            value=velocity,
+            params={
+                "unit": unit,
+                "max_acceleration": max_acceleration,
+                "max_jerk": max_jerk,
+            },
+        )
+        return True
+
+    def ruckig_stop(self) -> bool:
+        """Stop any active Ruckig motion for this drive (holds current position)."""
+        self._queue(CommandType.STOP_RUCKIG)
+        return True
+
     # Homing
     def start_homing(self, wait_for_completion: bool = False, timeout_s: float = 30.0) -> bool:
         self._queue(CommandType.START_HOMING, params={'wait_for_completion': wait_for_completion, 'timeout_s': timeout_s})
@@ -115,6 +168,35 @@ class CiA402Drive:
     def get_status_word(self) -> Optional[int]:
         return self._read_status_field('statusword')
 
+    def is_target_reached(self) -> bool:
+        # Prefer derived field if published; otherwise fall back to raw statusword bit 10.
+        tr = self._read_status_field('target_reached')
+        if tr is not None:
+            return bool(tr)
+        sw = self.get_status_word() or 0
+        return bool(sw & 0x0400)
+
+    def is_in_fault(self) -> bool:
+        fault = self._read_status_field('fault')
+        if fault is not None:
+            return bool(fault)
+        sw = self.get_status_word() or 0
+        return bool(sw & 0x0008)
+
+    def has_warning(self) -> bool:
+        warning = self._read_status_field('warning')
+        if warning is not None:
+            return bool(warning)
+        sw = self.get_status_word() or 0
+        return bool(sw & 0x0080)
+
+    def is_setpoint_acknowledged(self) -> bool:
+        ack = self._read_status_field('setpoint_ack')
+        if ack is not None:
+            return bool(ack)
+        sw = self.get_status_word() or 0
+        return bool(sw & 0x1000)
+
     def get_position(self, unit: str = 'native') -> Optional[float]:
         return self._read_status_field('position_actual')
 
@@ -140,12 +222,20 @@ class CiA402Drive:
         intent = self._last_intent
         if intent['type'] == CommandType.SET_POSITION_MODE:
             mode = self._read_status_field('mode_display')
+            # If mode display is not mapped into PDO, do NOT try to "fake" it.
+            # Treat verification as unknown/acceptable; the end application may SDO-read if it cares.
+            if mode is None:
+                return True
             return mode == MODE_PP
         if intent['type'] == CommandType.SET_VELOCITY_MODE:
             mode = self._read_status_field('mode_display')
+            if mode is None:
+                return True
             return mode == MODE_PV
         if intent['type'] == CommandType.SET_CSP_MODE:
             mode = self._read_status_field('mode_display')
+            if mode is None:
+                return True
             return mode == MODE_CSP
         if intent['type'] in (CommandType.SET_POSITION, CommandType.SET_POSITION_CSP):
             # Non-strict: position should move toward target; exact verification is domain-specific

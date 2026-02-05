@@ -132,7 +132,7 @@ Minute V2 discrepancy:
 - V1 pyethercat:
   - Provides `read_domain_data(offset, size)` and `write_domain_data(offset, bytes)` helpers.
 - V2 today:
-  - `ethercat_v2.master_adapter.Master` (direct ctypes) lacks `read_domain`/`write_domain` helpers but `process_manager` calls them. The alternate `IGHMasterAdapter` class (wrapper around pyethercat) does expose them.
+  - `ethercat_v2.igh_master.Master` (direct ctypes) lacks `read_domain`/`write_domain` helpers but `process_manager` calls them. The alternate `IGHMasterAdapter` class (wrapper around pyethercat) does expose them.
   - Requirement: Either:
     - Use `IGHMasterAdapter` wrapper in `process_manager`, or
     - Implement `read_domain`/`write_domain` in the local `Master` wrapper (by caching the domain pointer and slicing).

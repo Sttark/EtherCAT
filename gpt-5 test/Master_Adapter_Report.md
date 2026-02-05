@@ -4,7 +4,7 @@ This report documents every relevant C type, function signature, and handle beha
 
 Scope:
 - V1: SttarkStandardLibrary pyethercat bindings (imported in legacy code)
-- V2: Local ctypes-based `ethercat_v2.master_adapter.Master` plus optional wrapper `IGHMasterAdapter` that delegates to pyethercat
+- V2: Local ctypes-based `ethercat_v2.igh_master.Master` plus optional wrapper `IGHMasterAdapter` that delegates to pyethercat
 
 ---
 

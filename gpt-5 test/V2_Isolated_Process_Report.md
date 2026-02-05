@@ -8,7 +8,7 @@ Files reviewed:
 - `ethercat_v2/cia402/driver.py`
 - `ethercat_v2/constants.py`
 - `ethercat_v2/xml_decoder.py`
-- `ethercat_v2/master_adapter.py`
+- `ethercat_v2/igh_master.py`
 
 ---
 

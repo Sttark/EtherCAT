@@ -15,6 +15,9 @@ class CommandType(Enum):
     SET_POSITION_CSP = auto()
     SET_VELOCITY = auto()
     STOP_MOTION = auto()
+    START_RUCKIG_POSITION = auto()
+    START_RUCKIG_VELOCITY = auto()
+    STOP_RUCKIG = auto()
 
     # Drive state
     ENABLE_DRIVE = auto()
