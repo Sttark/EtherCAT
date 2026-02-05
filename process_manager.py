@@ -404,34 +404,6 @@ class EtherCATProcess:
             # Future: perform immediate SDO write
             pass
 
-    def _check_op_state(self):
-        """
-        Legacy OP detection fallback: detect OP by observing statusword != 0.
-        Prefer AL state via master.get_slave_info() (checked every cycle).
-        """
-        # Only check every 100 cycles after 100 cycles minimum
-        if self.cycle_count < 100 or self.cycle_count % 100 != 0:
-            return
-        
-        for slave_pos, entries in self.offsets.items():
-            # Skip if already detected as OP
-            if self.slave_in_op.get(slave_pos, False):
-                continue
-            
-            # Check statusword
-            if (SW_INDEX, 0) not in entries:
-                continue
-            
-            raw_sw = self.master.read_domain(self.domain, entries[(SW_INDEX, 0)], 2)
-            if not raw_sw:
-                continue
-            
-            statusword = int.from_bytes(raw_sw, 'little')
-            if statusword != 0:
-                self.slave_in_op[slave_pos] = True
-                logger.info(f"✓ Slave {slave_pos} reached OP state after {self.cycle_count} cycles "
-                          f"({self.cycle_count * self.cfg.cycle_time_ms / 1000:.1f}s) - statusword: 0x{statusword:04X}")
-    
     def _update_al_states(self):
         """
         Update OP tracking using IgH-provided AL state. This runs every PDO cycle and also

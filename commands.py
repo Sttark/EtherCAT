@@ -7,13 +7,19 @@ class CommandType(Enum):
     # Mode control
     SET_POSITION_MODE = auto()
     SET_VELOCITY_MODE = auto()
+    SET_TORQUE_MODE = auto()
     SET_CSP_MODE = auto()
+    SET_CSV_MODE = auto()
+    SET_CST_MODE = auto()
     START_HOMING = auto()
 
     # Motion
     SET_POSITION = auto()
-    SET_POSITION_CSP = auto()
     SET_VELOCITY = auto()
+    SET_TORQUE = auto()
+    SET_POSITION_CSP = auto()
+    SET_VELOCITY_CSV = auto()
+    SET_TORQUE_CST = auto()
     STOP_MOTION = auto()
     START_RUCKIG_POSITION = auto()
     START_RUCKIG_VELOCITY = auto()
