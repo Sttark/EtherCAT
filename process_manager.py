@@ -1,5 +1,6 @@
 import logging
 import multiprocessing as mp
+import os
 import queue
 import signal
 import time
@@ -911,6 +912,15 @@ class EtherCATProcess:
 
     def run(self):
         self._install_signal_handlers()
+
+        if self.cfg.rt_priority is not None:
+            SCHED_FIFO = 1
+            param = os.sched_param(self.cfg.rt_priority)
+            os.sched_setscheduler(0, SCHED_FIFO, param)
+
+        if self.cfg.cpu_core is not None:
+            os.sched_setaffinity(0, {self.cfg.cpu_core})
+
         ok = self._setup()
         if not ok:
             self._teardown()
