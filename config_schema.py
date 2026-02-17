@@ -66,10 +66,6 @@ class RuckigConfig:
 
 @dataclass
 class DriveConfig:
-    """
-    Generic drive configuration for CiA 402 devices.
-    Keep configuration minimal and explicit; avoid hard-coded defaults.
-    """
     position: int
     alias: int = 0
     vendor_id: Optional[int] = None
@@ -93,10 +89,13 @@ class DriveConfig:
     inertia_ratio: Optional[float] = None
     position_limits: Optional[Tuple[float, float, str]] = None
     features_overrides: Dict[str, Any] = field(default_factory=dict)
-    # --- Motion semantics overrides (device-specific) ---
-    # Some drives require a set-point strobe (controlword bit 4) not only for PP but also for PV/PT.
     pv_requires_setpoint_toggle: bool = False
     pt_requires_setpoint_toggle: bool = False
+    cia402: bool = True
+    startup_sdos: List[Tuple[int, int, bytes]] = field(default_factory=list)
+    sync_configs: Optional[List] = None
+    register_entries: Optional[List[Tuple[int, int]]] = None
+    pdo_read_sizes: Dict[Tuple[int, int], int] = field(default_factory=dict)
 
 
 @dataclass
@@ -134,6 +133,7 @@ class EthercatNetworkConfig:
     # Bit 12 (0x1000) is commonly "set-point acknowledged" in CiA402 PP.
     pp_ack_mask: int = 0x1000
     pp_ack_timeout_ms: float = 100.0
+    dc_reference_slave: Optional[int] = None
     slaves: List[DriveConfig] = field(default_factory=list)
 
 

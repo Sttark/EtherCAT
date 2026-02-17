@@ -100,6 +100,13 @@ class ec_sync_info_t(ctypes.Structure):
     ]
 
 
+class ec_domain_state_t(ctypes.Structure):
+    _fields_ = [
+        ("working_counter", ctypes.c_uint),
+        ("wc_state", ctypes.c_uint),
+    ]
+
+
 class ec_master_info_t(ctypes.Structure):
     _fields_ = [
         ("slave_count", ctypes.c_uint),
@@ -197,6 +204,12 @@ if _libec:
     _libec.ecrt_domain_queue.argtypes = [ctypes.POINTER(ec_domain_t)]
     _libec.ecrt_domain_queue.restype = None
 
+    _libec.ecrt_domain_state.argtypes = [
+        ctypes.POINTER(ec_domain_t),
+        ctypes.POINTER(ec_domain_state_t)
+    ]
+    _libec.ecrt_domain_state.restype = None
+
     _libec.ecrt_domain_reg_pdo_entry_list.argtypes = [
         ctypes.POINTER(ec_domain_t),
         ctypes.POINTER(ec_pdo_entry_reg_t)
@@ -239,11 +252,26 @@ if _libec:
     # IMPORTANT: in IgH headers (ecrt.h) this returns int (0 success, <0 error).
     _libec.ecrt_slave_config_dc.restype = ctypes.c_int
 
+    _libec.ecrt_slave_config_sdo.argtypes = [
+        ctypes.POINTER(ec_slave_config_t),
+        ctypes.c_uint16,
+        ctypes.c_uint8,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.c_size_t
+    ]
+    _libec.ecrt_slave_config_sdo.restype = ctypes.c_int
+
     _libec.ecrt_master_select_reference_clock.argtypes = [
         ctypes.POINTER(ec_master_t),
         ctypes.POINTER(ec_slave_config_t)
     ]
     _libec.ecrt_master_select_reference_clock.restype = None
+
+    _libec.ecrt_master_sync_reference_clock.argtypes = [ctypes.POINTER(ec_master_t)]
+    _libec.ecrt_master_sync_reference_clock.restype = ctypes.c_int
+
+    _libec.ecrt_master_sync_slave_clocks.argtypes = [ctypes.POINTER(ec_master_t)]
+    _libec.ecrt_master_sync_slave_clocks.restype = ctypes.c_int
 
 
 class SlaveConfig:
@@ -558,6 +586,22 @@ class Master:
         slave_config._sync_infos = sync_infos
         return True
 
+    def slave_config_sdo(self, slave_config: SlaveConfig, index: int, subindex: int, data: bytes) -> bool:
+        if not slave_config._config_handle:
+            raise MasterException("Slave not configured")
+        data_array = (ctypes.c_uint8 * len(data))(*data)
+        result = _libec.ecrt_slave_config_sdo(
+            slave_config._config_handle,
+            index,
+            subindex,
+            data_array,
+            len(data)
+        )
+        if result != 0:
+            raise MasterException(
+                f"Failed to register SDO config: index=0x{index:04X}, subindex={subindex}, result={result}")
+        return True
+
     def activate(self) -> bool:
         if not self._master_handle:
             raise MasterException("Master not requested")
@@ -594,6 +638,14 @@ class Master:
         except Exception as e:
             logger.error(f"Failed to select reference clock: {e}")
             return False
+
+    def sync_reference_clock(self):
+        if self._master_handle and self._activated:
+            _libec.ecrt_master_sync_reference_clock(self._master_handle)
+
+    def sync_slave_clocks(self):
+        if self._master_handle and self._activated:
+            _libec.ecrt_master_sync_slave_clocks(self._master_handle)
 
     def get_slave_count(self) -> int:
         if not self._master_handle:
@@ -738,6 +790,12 @@ class Master:
     def queue_domain(self, domain):
         if domain and self._activated:
             _libec.ecrt_domain_queue(domain)
+
+    def domain_state(self, domain) -> Tuple[int, int]:
+        state = ec_domain_state_t()
+        if domain and self._activated:
+            _libec.ecrt_domain_state(domain, ctypes.byref(state))
+        return (state.working_counter, state.wc_state)
 
 """
 NOTE: Adapter layer removed.

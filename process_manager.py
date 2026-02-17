@@ -3,7 +3,9 @@ import multiprocessing as mp
 import os
 import queue
 import signal
+import sys
 import time
+import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 from .commands import Command, CommandType
@@ -98,13 +100,13 @@ class EtherCATProcess:
         self._enable_requested: Dict[int, bool] = {}
         self._manual_disable: Dict[int, bool] = {}
 
-        # CSP atomic-swap targets (latest-wins, swapped at cycle boundary)
         self._csp_target_next: Dict[int, Optional[int]] = {}
         self._csp_target_cur: Dict[int, Optional[int]] = {}
-        # Default modes from config (if provided)
         self._default_mode: Dict[int, Optional[int]] = {}
-        # OP timeout tracking
         self._activated_mono_ns: Optional[int] = None
+        self._cia402_positions: set = set()
+        self._raw_pdo_writes: Dict[int, Dict[Tuple[int, int], bytes]] = {}
+        self._status_publish_count: int = 0
 
         # Ruckig (optional CSP trajectory generation)
         self._ruckig_planner: Optional[RuckigCspPlanner] = None
@@ -129,83 +131,108 @@ class EtherCATProcess:
         if not self.cfg.sdo_only:
             self.domain = self.master.create_domain()
 
-        # Configure each slave
         for dcfg in self.cfg.slaves:
-            if dcfg.vendor_id is None or dcfg.product_code is None or not dcfg.xml:
-                logger.error(f"Slave {dcfg.position} missing vendor_id/product_code/xml")
+            if dcfg.vendor_id is None or dcfg.product_code is None:
+                logger.error(f"Slave {dcfg.position} missing vendor_id/product_code")
                 return False
 
             s = self.master.config_slave(dcfg.alias, dcfg.position, dcfg.vendor_id, dcfg.product_code)
             self.slave_handles[dcfg.position] = s
             self._default_mode[dcfg.position] = dcfg.operation_mode
             if dcfg.operation_mode is not None and dcfg.position not in self.last_mode_cmd:
-                # Seed desired mode so the process can behave deterministically even if the app never
-                # sends explicit mode commands (user-controlled: set operation_mode or send commands).
                 self.last_mode_cmd[dcfg.position] = int(dcfg.operation_mode)
 
-            # Build PDO config from XML + overrides (device-scoped; avoids multi-Device mixing)
-            decoded = decode_esi(
-                dcfg.xml.xml_file,
-                vendor_id=dcfg.vendor_id,
-                product_code=dcfg.product_code,
-            )
-            rx_pdos = dcfg.pdo.rx_pdos if dcfg.pdo and dcfg.pdo.rx_pdos else decoded.rx_pdos
-            tx_pdos = dcfg.pdo.tx_pdos if dcfg.pdo and dcfg.pdo.tx_pdos else decoded.tx_pdos
+            if getattr(dcfg, 'cia402', True):
+                self._cia402_positions.add(dcfg.position)
 
-            # Build per-PDO entry maps (by-the-book for ecrt_slave_config_pdos)
-            rx_pdo_map = decoded.pdo_map_rx
-            tx_pdo_map = decoded.pdo_map_tx
-            if dcfg.pdo and dcfg.pdo.custom_pdo_config:
-                custom = dcfg.pdo.custom_pdo_config
-                # Assign all custom RX entries to the first RX PDO (common single-PDO pattern)
-                if rx_pdos and custom.get('rx_entries'):
-                    rx_pdo_map = {rx_pdos[0]: custom['rx_entries']}
-                if tx_pdos and custom.get('tx_entries'):
-                    tx_pdo_map = {tx_pdos[0]: custom['tx_entries']}
+            for (idx, sub, data) in getattr(dcfg, 'startup_sdos', []):
+                self.master.slave_config_sdo(s, idx, sub, data)
 
-            # Compute supports from the *effective* PDO maps (XML + overrides), so the handle's
-            # capability checks match reality (especially important when custom PDOs add probe objects).
-            flat_rx = [e for entries in rx_pdo_map.values() for e in entries]
-            flat_tx = [e for entries in tx_pdo_map.values() for e in entries]
-            supports = dict(decoded.supports or {})
-            supports.update(
-                {
-                    "controlword": any(e[0] == CW_INDEX for e in flat_rx),
-                    "statusword": any(e[0] == SW_INDEX for e in flat_tx),
-                    "mode_command": any(e[0] == MODES_OP_INDEX for e in flat_rx),
-                    "mode_display": any(e[0] == MODES_OP_DISPLAY_INDEX for e in flat_tx),
-                    "touch_probe": any(
-                        e[0]
-                        in (
-                            PROBE_FUNCTION_INDEX,
-                            PROBE_STATUS_INDEX,
-                            PROBE_POS1_INDEX,
-                            PROBE_POS2_INDEX,
-                            PROBE_POS2_ALT_INDEX,
-                        )
-                        for e in (flat_rx + flat_tx)
-                    ),
-                }
-            )
-            if getattr(dcfg, "features_overrides", None):
-                supports.update(dcfg.features_overrides)
+            if dcfg.xml:
+                decoded = decode_esi(
+                    dcfg.xml.xml_file,
+                    vendor_id=dcfg.vendor_id,
+                    product_code=dcfg.product_code,
+                )
+                rx_pdos = dcfg.pdo.rx_pdos if dcfg.pdo and dcfg.pdo.rx_pdos else decoded.rx_pdos
+                tx_pdos = dcfg.pdo.tx_pdos if dcfg.pdo and dcfg.pdo.tx_pdos else decoded.tx_pdos
 
-            sync_configs = []
-            if rx_pdos:
-                sync_configs.append((2, 1, [(p, rx_pdo_map.get(p, [])) for p in rx_pdos]))  # EC_DIR_OUTPUT
-            if tx_pdos:
-                sync_configs.append((3, 2, [(p, tx_pdo_map.get(p, [])) for p in tx_pdos]))  # EC_DIR_INPUT
+                rx_pdo_map = decoded.pdo_map_rx
+                tx_pdo_map = decoded.pdo_map_tx
+                if dcfg.pdo and dcfg.pdo.custom_pdo_config:
+                    custom = dcfg.pdo.custom_pdo_config
+                    if rx_pdos and custom.get('rx_entries'):
+                        rx_pdo_map = {rx_pdos[0]: custom['rx_entries']}
+                    if tx_pdos and custom.get('tx_entries'):
+                        tx_pdo_map = {tx_pdos[0]: custom['tx_entries']}
 
-            if not self.cfg.sdo_only:
-                self.master.configure_slave_pdos(s, sync_configs)
+                flat_rx = [e for entries in rx_pdo_map.values() for e in entries]
+                flat_tx = [e for entries in tx_pdo_map.values() for e in entries]
+                supports = dict(decoded.supports or {})
+                supports.update(
+                    {
+                        "controlword": any(e[0] == CW_INDEX for e in flat_rx),
+                        "statusword": any(e[0] == SW_INDEX for e in flat_tx),
+                        "mode_command": any(e[0] == MODES_OP_INDEX for e in flat_rx),
+                        "mode_display": any(e[0] == MODES_OP_DISPLAY_INDEX for e in flat_tx),
+                        "touch_probe": any(
+                            e[0]
+                            in (
+                                PROBE_FUNCTION_INDEX,
+                                PROBE_STATUS_INDEX,
+                                PROBE_POS1_INDEX,
+                                PROBE_POS2_INDEX,
+                                PROBE_POS2_ALT_INDEX,
+                            )
+                            for e in (flat_rx + flat_tx)
+                        ),
+                    }
+                )
 
-                # Bulk register PDO entries to obtain domain offsets (flatten per-PDO maps)
+                sync_configs = []
+                if rx_pdos:
+                    sync_configs.append((2, 1, [(p, rx_pdo_map.get(p, [])) for p in rx_pdos]))
+                if tx_pdos:
+                    sync_configs.append((3, 2, [(p, tx_pdo_map.get(p, [])) for p in tx_pdos]))
+
                 register_pairs = []
                 for p, entries in rx_pdo_map.items():
                     register_pairs.extend([(idx, sub) for (idx, sub, _bits) in entries])
                 for p, entries in tx_pdo_map.items():
                     register_pairs.extend([(idx, sub) for (idx, sub, _bits) in entries])
                 register_list = list(set(register_pairs))
+
+            elif getattr(dcfg, 'sync_configs', None) is not None:
+                sync_configs = dcfg.sync_configs
+                register_list = list(getattr(dcfg, 'register_entries', None) or [])
+
+                rx_pdo_map = {}
+                tx_pdo_map = {}
+                for sm_idx, direction, pdos in sync_configs:
+                    for pdo_idx, pdo_entries in pdos:
+                        if direction == 1:
+                            rx_pdo_map[pdo_idx] = pdo_entries
+                        elif direction == 2:
+                            tx_pdo_map[pdo_idx] = pdo_entries
+
+                flat_rx = [e for ent in rx_pdo_map.values() for e in ent]
+                flat_tx = [e for ent in tx_pdo_map.values() for e in ent]
+                supports = {
+                    "controlword": any(e[0] == CW_INDEX for e in flat_rx),
+                    "statusword": any(e[0] == SW_INDEX for e in flat_tx),
+                    "mode_command": any(e[0] == MODES_OP_INDEX for e in flat_rx),
+                    "mode_display": any(e[0] == MODES_OP_DISPLAY_INDEX for e in flat_tx),
+                }
+            else:
+                logger.error(f"Slave {dcfg.position}: requires either xml or sync_configs")
+                return False
+
+            if getattr(dcfg, "features_overrides", None):
+                supports.update(dcfg.features_overrides)
+
+            if not self.cfg.sdo_only:
+                self.master.configure_slave_pdos(s, sync_configs)
+
                 offsets = self.master.register_pdo_entry_list(
                     self.domain, dcfg.alias, dcfg.position, dcfg.vendor_id, dcfg.product_code, register_list
                 )
@@ -215,27 +242,17 @@ class EtherCATProcess:
                     'tx': tx_pdo_map,
                 }
 
-            # Track features for this slave
             self.features[dcfg.position] = supports
-            # Enable intent defaults: auto-enable unless explicitly disabled
-            self._enable_requested.setdefault(dcfg.position, True)
+            self._enable_requested.setdefault(dcfg.position, dcfg.position in self._cia402_positions)
             self._manual_disable.setdefault(dcfg.position, False)
-            
-            # Configure DC (Distributed Clocks) if enabled
+
             if dcfg.enable_dc and not self.cfg.sdo_only:
-                # Use cycle time from network config
-                cycle_time_ns = int(self.cfg.cycle_time_ms * 1_000_000)  # Convert ms to ns
-                
-                # Use configured DC values or defaults
+                cycle_time_ns = int(self.cfg.cycle_time_ms * 1_000_000)
                 dc_assign = dcfg.dc_assign_activate if dcfg.dc_assign_activate is not None else 0x0300
                 sync0_shift = dcfg.dc_sync0_shift_ns
                 sync1_cycle = dcfg.dc_sync1_cycle_time_ns
                 sync1_shift = dcfg.dc_sync1_shift_ns
-                
-                logger.info(f"Configuring DC for slave {dcfg.position}...")
-                logger.info(f"  Cycle time: {self.cfg.cycle_time_ms}ms = {cycle_time_ns}ns")
-                logger.info(f"  DC assign_activate: 0x{dc_assign:04X}")
-                
+
                 s.config_dc(
                     assign_activate=dc_assign,
                     sync0_cycle_time_ns=cycle_time_ns,
@@ -243,18 +260,17 @@ class EtherCATProcess:
                     sync1_cycle_time_ns=sync1_cycle,
                     sync1_shift_ns=sync1_shift
                 )
-                logger.info(f"✓ DC configured for slave {dcfg.position}")
+                logger.info(f"DC configured for slave {dcfg.position}")
 
-        # Initialize Ruckig planner if any drive enables it in config
         if any(bool(getattr(d, "ruckig", None) and getattr(d.ruckig, "enabled", False)) for d in self.cfg.slaves):
             self._ruckig_planner = RuckigCspPlanner()
             if not self._ruckig_planner.available():
-                logger.warning("Ruckig is enabled in config but the `ruckig` package is not available in this process.")
+                logger.warning("Ruckig is enabled in config but the ruckig package is not available.")
 
         if not self.cfg.sdo_only:
-            # PDO mode correctness gate: 0x6040/0x6041 must be mapped for every slave in PDO mode.
-            # Without these, OP detection and CiA402 enable state machine are unsafe/undefined.
             for dcfg in self.cfg.slaves:
+                if dcfg.position not in self._cia402_positions:
+                    continue
                 entries = self.offsets.get(dcfg.position, {})
                 missing = []
                 if (CW_INDEX, 0) not in entries:
@@ -263,31 +279,48 @@ class EtherCATProcess:
                     missing.append(f"0x{SW_INDEX:04X}:0 (statusword)")
                 if missing:
                     raise RuntimeError(
-                        f"PDO mode requires 0x6040/0x6041 mapped. Slave {dcfg.position} is missing: {', '.join(missing)}"
+                        f"CiA402 slave {dcfg.position} requires 0x6040/0x6041 mapped. Missing: {', '.join(missing)}"
                     )
 
-            # Select DC reference clock (use first DC-enabled slave)
-            for dcfg in self.cfg.slaves:
-                if dcfg.enable_dc:
-                    s = self.slave_handles.get(dcfg.position)
-                    if s:
-                        self.master.select_reference_clock(s)
-                        logger.info(f"Selected slave {dcfg.position} as DC reference clock")
-                        break
-            
-            # Set initial application time BEFORE activation (critical for DC slaves)
+            dc_ref_pos = getattr(self.cfg, 'dc_reference_slave', None)
+            if dc_ref_pos is not None:
+                s = self.slave_handles.get(dc_ref_pos)
+                if s:
+                    self.master.select_reference_clock(s)
+                    logger.info(f"Selected slave {dc_ref_pos} as DC reference clock (explicit config)")
+                else:
+                    logger.error(f"dc_reference_slave={dc_ref_pos} not found in slave_handles")
+            else:
+                for dcfg in self.cfg.slaves:
+                    if dcfg.enable_dc:
+                        s = self.slave_handles.get(dcfg.position)
+                        if s:
+                            self.master.select_reference_clock(s)
+                            logger.info(f"Selected slave {dcfg.position} as DC reference clock (first DC-enabled)")
+                            break
+
             initial_time_ns = int(time.time() * 1_000_000_000)
             try:
                 self.master.set_application_time(initial_time_ns)
-                logger.info(f"Set initial DC application time: {initial_time_ns} ns")
-            except Exception as e:
-                logger.warning(f"Could not set application time: {e}")
-            
+            except Exception:
+                pass
+
+            for dcfg in self.cfg.slaves:
+                if dcfg.position not in self._cia402_positions:
+                    continue
+                entries = self.offsets.get(dcfg.position, {})
+                mode = self.last_mode_cmd.get(dcfg.position)
+                if mode is not None and (MODES_OP_INDEX, 0) not in entries:
+                    s = self.slave_handles.get(dcfg.position)
+                    if s:
+                        self.master.slave_config_sdo(s, MODES_OP_INDEX, 0, bytes([mode]))
+                        logger.info(f"Slave {dcfg.position}: mode 0x{mode:02X} registered as startup SDO")
+                    self.warned_missing_pdo.setdefault(dcfg.position, set()).add((MODES_OP_INDEX, 0))
+
             self.master.activate()
-            logger.info("Master activated - slave will reach OP state in cyclic loop")
+            logger.info("Master activated")
             self._activated_mono_ns = time.monotonic_ns()
-            
-            # Initialize OP tracking for all slaves
+
             for dcfg in self.cfg.slaves:
                 self.slave_in_op[dcfg.position] = False
                 self.last_al_state[dcfg.position] = None
@@ -398,52 +431,14 @@ class EtherCATProcess:
             self._pv_pulse_active[cmd.target_id] = False
             self._pv_pulse_start_ns[cmd.target_id] = None
             self._pv_pulse_pending[cmd.target_id] = False
+        elif cmd.type == CommandType.WRITE_RAW_PDO:
+            pos = cmd.target_id
+            key = (cmd.params["index"], cmd.params["subindex"])
+            self._raw_pdo_writes.setdefault(pos, {})[key] = cmd.value
         elif cmd.type == CommandType.READ_SDO:
-            # Future: perform immediate SDO read and publish asynchronously
             pass
         elif cmd.type == CommandType.WRITE_SDO:
-            # Future: perform immediate SDO write
             pass
-
-    def _update_al_states(self):
-        """
-        Update OP tracking using IgH-provided AL state. This runs every PDO cycle and also
-        detects when a slave falls OUT of OP.
-        """
-        for dcfg in self.cfg.slaves:
-            pos = dcfg.position
-            info = None
-            try:
-                info = self.master.get_slave_info(pos)
-            except Exception:
-                info = None
-
-            if not info or 'al_state' not in info:
-                # No AL state available; keep existing values (fallback statusword-based detector may still flip OP true).
-                continue
-
-            al_state = int(info.get('al_state', 0))
-            prev = self.last_al_state.get(pos)
-            self.last_al_state[pos] = al_state
-
-            in_op_now = (al_state == AL_STATE_OP)
-            in_op_prev = bool(self.slave_in_op.get(pos, False))
-
-            if in_op_now and not in_op_prev:
-                self.slave_in_op[pos] = True
-                logger.info(f"✓ Slave {pos} entered OP (AL state {al_state})")
-            elif (not in_op_now) and in_op_prev:
-                # Falling out of OP: immediately mark not enabled so we stop issuing motion-related handshakes.
-                self.slave_in_op[pos] = False
-                if self.drive_enabled.get(pos, False):
-                    logger.warning(f"⚠️ Slave {pos} left OP (AL state {al_state}) - disabling drive state until OP returns")
-                self.drive_enabled[pos] = False
-                # Clear state machine intent; it will re-run once OP returns.
-                self.desired_controlword.pop(pos, None)
-                # Clear PP pulse state; must re-issue a fresh pulse after OP returns.
-                self._pp_pulse_active[pos] = False
-                self._pp_pulse_start_ns[pos] = None
-                self._pp_pulse_pending[pos] = False
 
     def _auto_enable_drives(self):
         """
@@ -455,10 +450,10 @@ class EtherCATProcess:
         now_ns = time.monotonic_ns()
 
         for slave_pos, entries in self.offsets.items():
-            # Only enable if slave is in OP
+            if slave_pos not in self._cia402_positions:
+                continue
             if not self.slave_in_op.get(slave_pos, False):
                 continue
-            # Manual disable must suppress auto-enable.
             if self._manual_disable.get(slave_pos, False) or not self._enable_requested.get(slave_pos, True):
                 # Keep drive disabled and avoid advancing state machine.
                 self.desired_controlword[slave_pos] = 0x0000  # Disable voltage
@@ -539,13 +534,22 @@ class EtherCATProcess:
         status.timestamp_ns = int(time.time() * 1_000_000_000)
         status.cycle_time_ms_config = self.cfg.cycle_time_ms
         status.sdo_only = self.cfg.sdo_only
-        # Example: read back status fields when offsets known
         for slave_pos, entries in self.offsets.items():
             drive = {}
-            # Include OP state
             drive['in_op'] = self.slave_in_op.get(slave_pos, False)
-            if self.last_al_state.get(slave_pos) is not None:
-                drive['al_state'] = self.last_al_state.get(slave_pos)
+
+            if slave_pos not in self._cia402_positions:
+                dcfg = next((d for d in self.cfg.slaves if d.position == slave_pos), None)
+                sizes = getattr(dcfg, 'pdo_read_sizes', {}) if dcfg else {}
+                raw_data = {}
+                for key, offset in entries.items():
+                    sz = sizes.get(key, 1)
+                    raw = self.master.read_domain(self.domain, offset, sz) or bytes(sz)
+                    raw_data[key] = int.from_bytes(raw, 'little')
+                drive['raw_pdo'] = raw_data
+                status.drives[slave_pos] = drive
+                continue
+
             if (SW_INDEX, 0) in entries:
                 raw = self.master.read_domain(self.domain, entries[(SW_INDEX, 0)], 2) or b"\x00\x00"
                 sw = int.from_bytes(raw, 'little')
@@ -607,8 +611,16 @@ class EtherCATProcess:
             status.drives[slave_pos] = drive
         try:
             self.status_q.put_nowait(status)
+            if self._status_publish_count < 3:
+                self._status_publish_count += 1
+                sys.stderr.write(f"[EC] status published cycle={self.cycle_count} drives={list(status.drives.keys())} qsize={self.status_q.qsize()}\n")
+                sys.stderr.flush()
         except queue.Full:
             pass
+        except Exception as e:
+            sys.stderr.write(f"[EC] status_q.put FAILED: {e}\n")
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
 
     def _cyclic_write(self):
         """
@@ -618,32 +630,36 @@ class EtherCATProcess:
         """
         if self.cfg.sdo_only or self.domain is None:
             return
-        # Example offsets lookup (to be set during registration step):
-        # offsets[slave_pos][(index, subindex)] -> byte_offset
+
+        for pos, writes in self._raw_pdo_writes.items():
+            entries = self.offsets.get(pos, {})
+            for key, data in writes.items():
+                if key in entries:
+                    self.master.write_domain(self.domain, entries[key], data)
+
         for slave_pos, entries in self.offsets.items():
-            # Pre-read statusword when needed (PP ack/clear and enable state machine already requires it).
+            if slave_pos not in self._cia402_positions:
+                continue
             statusword = None
             if (SW_INDEX, 0) in entries:
                 raw_sw = self.master.read_domain(self.domain, entries[(SW_INDEX, 0)], 2)
                 if raw_sw:
                     statusword = int.from_bytes(raw_sw, 'little')
 
-            # Maintain operation mode (0x6060) if mapped and requested
             mode = self.last_mode_cmd.get(slave_pos)
             if mode is not None:
                 if (MODES_OP_INDEX, 0) in entries:
                     self.master.write_domain(self.domain, entries[(MODES_OP_INDEX, 0)], bytes([mode]))
                 else:
-                    # Fallback to SDO and warn once
-                    warned = self.warned_missing_pdo.setdefault(slave_pos, set())
+                    sdo_done = self.warned_missing_pdo.setdefault(slave_pos, set())
                     key = (MODES_OP_INDEX, 0)
-                    if key not in warned:
-                        logger.warning(f"Slave {slave_pos}: {hex(MODES_OP_INDEX)} not in PDO; writing via SDO")
-                        warned.add(key)
-                    try:
-                        self.master.sdo_download(slave_pos, MODES_OP_INDEX, 0, bytes([mode]))
-                    except Exception as e:
-                        logger.error(f"SDO write {hex(MODES_OP_INDEX)} failed: {e}")
+                    if key not in sdo_done:
+                        logger.warning(f"Slave {slave_pos}: {hex(MODES_OP_INDEX)} not in PDO; writing via SDO (once)")
+                        try:
+                            self.master.sdo_download(slave_pos, MODES_OP_INDEX, 0, bytes([mode]))
+                        except Exception as e:
+                            logger.error(f"SDO write {hex(MODES_OP_INDEX)} failed: {e}")
+                        sdo_done.add(key)
 
             # Safety: do not write motion targets until drive is enabled.
             # Some drives fault (e.g., following error / excessive reference) if targets stream before enable.
@@ -656,15 +672,15 @@ class EtherCATProcess:
                 if (TARGET_VELOCITY_INDEX, 0) in entries:
                     self.master.write_domain(self.domain, entries[(TARGET_VELOCITY_INDEX, 0)], v.to_bytes(4, byteorder='little', signed=True))
                 else:
-                    warned = self.warned_missing_pdo.setdefault(slave_pos, set())
+                    sdo_done = self.warned_missing_pdo.setdefault(slave_pos, set())
                     key = (TARGET_VELOCITY_INDEX, 0)
-                    if key not in warned:
-                        logger.warning(f"Slave {slave_pos}: {hex(TARGET_VELOCITY_INDEX)} not in PDO; writing via SDO")
-                        warned.add(key)
-                    try:
-                        self.master.sdo_download(slave_pos, TARGET_VELOCITY_INDEX, 0, v.to_bytes(4, 'little', signed=True))
-                    except Exception as e:
-                        logger.error(f"SDO write {hex(TARGET_VELOCITY_INDEX)} failed: {e}")
+                    if key not in sdo_done:
+                        logger.warning(f"Slave {slave_pos}: {hex(TARGET_VELOCITY_INDEX)} not in PDO; writing via SDO (once)")
+                        try:
+                            self.master.sdo_download(slave_pos, TARGET_VELOCITY_INDEX, 0, v.to_bytes(4, 'little', signed=True))
+                        except Exception as e:
+                            logger.error(f"SDO write {hex(TARGET_VELOCITY_INDEX)} failed: {e}")
+                        sdo_done.add(key)
                 # PV pulse is "edge-ish": if we asserted bit4 at least once, clear pending so it becomes
                 # a bounded pulse (active clears on ack/timeout). This prevents indefinite re-triggering.
                 if self._pv_pulse_pending.get(slave_pos, False) and self._pv_pulse_active.get(slave_pos, False):
@@ -688,15 +704,15 @@ class EtherCATProcess:
                 if (TARGET_POSITION_INDEX, 0) in entries:
                     self.master.write_domain(self.domain, entries[(TARGET_POSITION_INDEX, 0)], p.to_bytes(4, byteorder='little', signed=True))
                 else:
-                    warned = self.warned_missing_pdo.setdefault(slave_pos, set())
+                    sdo_done = self.warned_missing_pdo.setdefault(slave_pos, set())
                     key = (TARGET_POSITION_INDEX, 0)
-                    if key not in warned:
-                        logger.warning(f"Slave {slave_pos}: {hex(TARGET_POSITION_INDEX)} not in PDO; writing via SDO")
-                        warned.add(key)
-                    try:
-                        self.master.sdo_download(slave_pos, TARGET_POSITION_INDEX, 0, p.to_bytes(4, 'little', signed=True))
-                    except Exception as e:
-                        logger.error(f"SDO write {hex(TARGET_POSITION_INDEX)} failed: {e}")
+                    if key not in sdo_done:
+                        logger.warning(f"Slave {slave_pos}: {hex(TARGET_POSITION_INDEX)} not in PDO; writing via SDO (once)")
+                        try:
+                            self.master.sdo_download(slave_pos, TARGET_POSITION_INDEX, 0, p.to_bytes(4, 'little', signed=True))
+                        except Exception as e:
+                            logger.error(f"SDO write {hex(TARGET_POSITION_INDEX)} failed: {e}")
+                        sdo_done.add(key)
 
             # Controlword bit maintenance (0x6040):
             # Build controlword from desired state machine value + motion bits
@@ -911,6 +927,17 @@ class EtherCATProcess:
                 self._csp_target_next[pos] = int(step.position)
 
     def run(self):
+        try:
+            self._run_inner()
+        except SystemExit:
+            raise
+        except Exception:
+            sys.stderr.write("ETHERCAT PROCESS FATAL:\n")
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+            raise
+
+    def _run_inner(self):
         self._install_signal_handlers()
 
         if self.cfg.rt_priority is not None:
@@ -930,7 +957,6 @@ class EtherCATProcess:
         if cycle_ns <= 0:
             raise ValueError("cycle_time_ms must be > 0")
 
-        # Drift-correct cyclic schedule: base wall time to monotonic clock, then advance in fixed ns steps.
         mono_base = time.monotonic_ns()
         wall_base = time.time_ns()
         next_cycle_mono = mono_base
@@ -941,8 +967,7 @@ class EtherCATProcess:
                 self.cycle_count += 1
                 next_cycle_mono += cycle_ns
                 scheduled_wall_ns = wall_base + (next_cycle_mono - mono_base)
-                
-                # Pump commands
+
                 for _ in range(16):
                     try:
                         cmd = self.cmd_q.get_nowait()
@@ -950,56 +975,59 @@ class EtherCATProcess:
                     except queue.Empty:
                         break
 
-                # Cyclic PDO exchange
                 if not self.cfg.sdo_only and self.domain is not None:
-                    # Maintain application/DC time (aligned to cyclic schedule)
-                    try:
-                        self.master.set_application_time(int(scheduled_wall_ns))
-                    except Exception:
-                        pass
-
                     self.master.receive()
                     self.master.process_domain(self.domain)
 
-                    # Update OP state from AL state every cycle (and detect falling out of OP).
-                    self._update_al_states()
-                    # Fallback OP detection (statusword != 0) if AL state isn't available.
-                    self._check_op_state()
+                    wc, wc_state = self.master.domain_state(self.domain)
+                    all_op_now = (wc_state == 2)
+                    for pos in self.slave_in_op:
+                        was_op = self.slave_in_op[pos]
+                        if all_op_now and not was_op:
+                            self.slave_in_op[pos] = True
+                            logger.info(f"Slave {pos} entered OP (domain WC={wc}, state=complete)")
+                        elif not all_op_now and was_op:
+                            self.slave_in_op[pos] = False
+                            self.drive_enabled[pos] = False
+                            self.desired_controlword.pop(pos, None)
+                            self._pp_pulse_active[pos] = False
+                            self._pp_pulse_start_ns[pos] = None
+                            self._pp_pulse_pending[pos] = False
+                            logger.warning(f"Slave {pos} left OP (domain WC={wc}, state={wc_state})")
 
-                    # OP timeout guard (prevents infinite SAFEOP stalls)
                     if self._activated_mono_ns is not None:
                         elapsed_s = (time.monotonic_ns() - self._activated_mono_ns) / 1_000_000_000.0
                         if elapsed_s >= float(self.cfg.op_timeout_s):
                             not_op = [p for p in self.slave_in_op.keys() if not self.slave_in_op.get(p, False)]
                             if not_op:
-                                states = {p: self.last_al_state.get(p) for p in not_op}
-                                raise RuntimeError(f"OP timeout after {self.cfg.op_timeout_s}s. Not in OP: {not_op}. AL states: {states}")
+                                raise RuntimeError(f"OP timeout after {self.cfg.op_timeout_s}s. Not in OP: {not_op}. Domain WC={wc}, state={wc_state}")
 
-                    # Run CiA 402 automatic enable state machine (only after OP)
                     self._auto_enable_drives()
-                    # Update optional Ruckig trajectory generator (feeds CSP buffer)
                     self._update_ruckig()
-                    # Apply maintenance writes
                     self._cyclic_write()
+
+                    try:
+                        self.master.set_application_time(int(scheduled_wall_ns))
+                    except Exception:
+                        pass
+                    self.master.sync_reference_clock()
+                    self.master.sync_slave_clocks()
+
                     self.master.queue_domain(self.domain)
                     self.master.send()
 
-                # Periodic status publish (decouple from cycle rate)
                 now = time.time()
                 if now - last_status > 0.05:
                     self._publish_status()
                     last_status = now
 
-                # Sleep until scheduled next cycle (drift-correcting). If we fell behind badly, resync.
                 sleep_ns = next_cycle_mono - time.monotonic_ns()
-                if sleep_ns > 0:
-                    time.sleep(sleep_ns / 1_000_000_000.0)
-                else:
-                    # Overrun: if we're more than one cycle late, resync bases to avoid runaway drift.
-                    if sleep_ns < -cycle_ns:
-                        mono_base = time.monotonic_ns()
-                        wall_base = time.time_ns()
-                        next_cycle_mono = mono_base
+                if sleep_ns <= 0:
+                    mono_base = time.monotonic_ns()
+                    wall_base = time.time_ns()
+                    next_cycle_mono = mono_base + cycle_ns
+                    sleep_ns = cycle_ns
+                time.sleep(sleep_ns / 1_000_000_000.0)
         finally:
             self._teardown()
 
@@ -1033,20 +1061,24 @@ class EtherCATProcessManager:
         return self._proc.exitcode
 
     def stop(self):
-        """Clean shutdown of the EtherCAT process"""
-        if self._proc and self._proc.is_alive():
-            logger.info("Stopping EtherCAT process...")
-            # Signal the process to stop gracefully
-            self._stop_event.set()
-            # Wait for clean shutdown
-            self._proc.join(timeout=3.0)
-            # If still alive, force terminate as fallback
-            if self._proc.is_alive():
-                logger.warning("Process did not stop cleanly, terminating...")
-                self._proc.terminate()
-                self._proc.join(timeout=1.0)
+        if not self._proc:
+            return
+        if not self._proc.is_alive():
             self._proc = None
-            logger.info("EtherCAT process stopped")
+            return
+        logger.info("Stopping EtherCAT process...")
+        self._stop_event.set()
+        self._proc.join(timeout=5.0)
+        if self._proc.is_alive():
+            logger.warning("Graceful stop timed out, sending SIGTERM...")
+            self._proc.terminate()
+            self._proc.join(timeout=2.0)
+        if self._proc.is_alive():
+            logger.warning("SIGTERM timed out, sending SIGKILL...")
+            self._proc.kill()
+            self._proc.join(timeout=2.0)
+        self._proc = None
+        logger.info("EtherCAT process stopped")
 
     # Application API
     def send_command(self, cmd: Command):

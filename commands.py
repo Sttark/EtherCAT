@@ -34,6 +34,9 @@ class CommandType(Enum):
     ARM_PROBE = auto()
     DISABLE_PROBE = auto()
 
+    # Raw I/O
+    WRITE_RAW_PDO = auto()
+
     # Diagnostics and housekeeping
     NO_OP = auto()
     CLEAR_FAULT = auto()
