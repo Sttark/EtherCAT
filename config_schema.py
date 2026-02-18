@@ -80,6 +80,7 @@ class DriveConfig:
     profile_velocity: Optional[float] = None
     profile_acceleration: Optional[float] = None
     max_velocity: Optional[float] = None
+    max_torque: Optional[float] = None
     homing: Optional[HomingConfig] = None
     xml: Optional[XmlConfig] = None
     pdo: Optional[PdoSelection] = None

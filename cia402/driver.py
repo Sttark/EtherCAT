@@ -220,6 +220,9 @@ class CiA402Drive:
     def get_torque(self, unit: str = 'native') -> Optional[float]:
         return self._read_status_field('torque_actual')
 
+    def get_error_code(self) -> Optional[int]:
+        return self._read_status_field('error_code')
+
     # Internal helpers delegated to the process runtime via injection
     def _queue(self, cmd_type: CommandType, value: Optional[float] = None, params: Optional[Dict] = None) -> None:
         if not hasattr(self, '_enqueue_command'):

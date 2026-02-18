@@ -13,9 +13,10 @@ from .status_model import NetworkStatus
 from .constants import (
     CW_INDEX, SW_INDEX,
     MODES_OP_INDEX, MODES_OP_DISPLAY_INDEX,
-    TARGET_POSITION_INDEX, TARGET_VELOCITY_INDEX, TARGET_TORQUE_INDEX,
+    TARGET_POSITION_INDEX, TARGET_VELOCITY_INDEX, TARGET_TORQUE_INDEX, MAX_TORQUE_INDEX,
     POSITION_ACTUAL_INDEX, VELOCITY_ACTUAL_INDEX, TORQUE_ACTUAL_INDEX,
     PROBE_FUNCTION_INDEX, PROBE_STATUS_INDEX, PROBE_POS1_INDEX, PROBE_POS2_INDEX, PROBE_POS2_ALT_INDEX, DIGITAL_INPUTS_INDEX,
+    ERROR_CODE_INDEX,
     MODE_PP, MODE_PV, MODE_PT, MODE_CSP, MODE_HM,
     CW_BIT_NEW_SET_POINT, CW_BIT_CHANGE_IMMEDIATELY, CW_BIT_ABS_REL, CW_BIT_HALT, CW_ENABLE_OP_SIMPLIFIED,
     PROBE_FUNC_ENABLE_PROBE1, PROBE_FUNC_PROBE1_POS_EDGE, PROBE_FUNC_PROBE1_NEG_EDGE,
@@ -199,12 +200,11 @@ class EtherCATProcess:
                 if tx_pdos:
                     sync_configs.append((3, 2, [(p, tx_pdo_map.get(p, [])) for p in tx_pdos]))
 
-                register_pairs = []
-                for p, entries in rx_pdo_map.items():
-                    register_pairs.extend([(idx, sub) for (idx, sub, _bits) in entries])
-                for p, entries in tx_pdo_map.items():
-                    register_pairs.extend([(idx, sub) for (idx, sub, _bits) in entries])
-                register_list = list(set(register_pairs))
+                register_list = []
+                for sm_idx, direction, pdos in sync_configs:
+                    for pdo_idx, pdo_entries in pdos:
+                        for idx, sub, _bits in pdo_entries:
+                            register_list.append((idx, sub))
 
             elif getattr(dcfg, 'sync_configs', None) is not None:
                 sync_configs = dcfg.sync_configs
@@ -321,6 +321,20 @@ class EtherCATProcess:
                         logger.info(f"Slave {dcfg.position}: mode 0x{mode:02X} registered as startup SDO")
                     self._last_mode_sdo[dcfg.position] = mode
 
+            for dcfg in self.cfg.slaves:
+                if dcfg.position not in self._cia402_positions:
+                    continue
+                entries = self.offsets.get(dcfg.position, {})
+                if (TARGET_TORQUE_INDEX, 0) not in entries:
+                    continue
+                s = self.slave_handles.get(dcfg.position)
+                if s:
+                    try:
+                        self.master.slave_config_sdo(s, MAX_TORQUE_INDEX, 0, (1000).to_bytes(2, 'little', signed=True))
+                        logger.info(f"Slave {dcfg.position}: 0x6072 (max torque) set to 1000 (100%% per-mille)")
+                    except Exception as e:
+                        logger.warning(f"Slave {dcfg.position}: could not set 0x6072: {e}")
+
             self.master.activate()
             logger.info("Master activated")
             self._activated_mono_ns = time.monotonic_ns()
@@ -397,9 +411,17 @@ class EtherCATProcess:
         elif cmd.type == CommandType.SET_CSP_MODE:
             self.last_mode_cmd[cmd.target_id] = MODE_CSP
         elif cmd.type == CommandType.SET_TORQUE_MODE:
+            self.last_velocity_cmd[cmd.target_id] = 0.0
             self.last_mode_cmd[cmd.target_id] = MODE_PT
         elif cmd.type == CommandType.SET_VELOCITY:
-            self.last_velocity_cmd[cmd.target_id] = float(cmd.value or 0.0)
+            raw = float(cmd.value or 0.0)
+            dcfg = next((d for d in self.cfg.slaves if d.position == cmd.target_id), None)
+            cap = getattr(dcfg, 'max_velocity', None)
+            if cap is None:
+                cap = 500000.0
+            if abs(raw) > cap:
+                raw = cap if raw > 0 else -cap
+            self.last_velocity_cmd[cmd.target_id] = raw
             # If this drive requires a set-point pulse to latch PV targets, schedule it.
             dcfg = next((d for d in self.cfg.slaves if d.position == cmd.target_id), None)
             if dcfg and getattr(dcfg, 'pv_requires_setpoint_toggle', False):
@@ -436,7 +458,14 @@ class EtherCATProcess:
             if probe_value is not None:
                 self.last_probe_arm[cmd.target_id] = int(probe_value)
         elif cmd.type == CommandType.SET_TORQUE:
-            self.last_torque_cmd[cmd.target_id] = float(cmd.value or 0.0)
+            raw = float(cmd.value or 0.0)
+            dcfg = next((d for d in self.cfg.slaves if d.position == cmd.target_id), None)
+            cap = getattr(dcfg, 'max_torque', None)
+            if cap is None:
+                cap = 800.0
+            if abs(raw) > cap:
+                raw = cap if raw > 0 else -cap
+            self.last_torque_cmd[cmd.target_id] = raw
         elif cmd.type == CommandType.STOP_MOTION:
             self.last_velocity_cmd[cmd.target_id] = 0.0
             self.last_torque_cmd[cmd.target_id] = 0.0
@@ -652,6 +681,9 @@ class EtherCATProcess:
             if (DIGITAL_INPUTS_INDEX, 0) in entries:
                 raw = self.master.read_domain(self.domain, entries[(DIGITAL_INPUTS_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
                 drive['digital_inputs'] = int.from_bytes(raw, 'little')
+            if (ERROR_CODE_INDEX, 0) in entries:
+                raw = self.master.read_domain(self.domain, entries[(ERROR_CODE_INDEX, 0)], 2) or b"\x00\x00"
+                drive['error_code'] = int.from_bytes(raw, 'little')
             # Publish static feature capabilities (from XML-derived supports)
             drive['features'] = self.features.get(slave_pos, {})
             # Publish Ruckig planner state
@@ -719,29 +751,29 @@ class EtherCATProcess:
                         except Exception as e:
                             logger.error(f"SDO write {hex(MODES_OP_INDEX)} failed: {e}")
 
-            # Safety: do not write motion targets until drive is enabled.
-            # Some drives fault (e.g., following error / excessive reference) if targets stream before enable.
             motion_ok = self.drive_enabled.get(slave_pos, False) and not self._manual_disable.get(slave_pos, False)
+            mode_eff = mode if mode is not None else self._default_mode.get(slave_pos)
 
-            # Maintain target velocity (0x60FF) for PV
-            vel = self.last_velocity_cmd.get(slave_pos)
-            if motion_ok and vel is not None:
-                v = int(vel)
-                if (TARGET_VELOCITY_INDEX, 0) in entries:
-                    self.master.write_domain(self.domain, entries[(TARGET_VELOCITY_INDEX, 0)], v.to_bytes(4, byteorder='little', signed=True))
+            if motion_ok:
+                if mode_eff == MODE_PT:
+                    v = 0
                 else:
-                    prev_sdo_vel = self._last_velocity_sdo.get(slave_pos)
-                    if v != prev_sdo_vel:
-                        logger.info(f"Slave {slave_pos}: {hex(TARGET_VELOCITY_INDEX)} not in PDO; writing vel={v} via SDO")
-                        try:
-                            self.master.sdo_download(slave_pos, TARGET_VELOCITY_INDEX, 0, v.to_bytes(4, 'little', signed=True))
-                            self._last_velocity_sdo[slave_pos] = v
-                        except Exception as e:
-                            logger.error(f"SDO write {hex(TARGET_VELOCITY_INDEX)} failed: {e}")
-                # PV pulse is "edge-ish": if we asserted bit4 at least once, clear pending so it becomes
-                # a bounded pulse (active clears on ack/timeout). This prevents indefinite re-triggering.
-                if self._pv_pulse_pending.get(slave_pos, False) and self._pv_pulse_active.get(slave_pos, False):
-                    self._pv_pulse_pending[slave_pos] = False
+                    vel = self.last_velocity_cmd.get(slave_pos)
+                    v = int(vel) if vel is not None else None
+                if v is not None:
+                    if (TARGET_VELOCITY_INDEX, 0) in entries:
+                        self.master.write_domain(self.domain, entries[(TARGET_VELOCITY_INDEX, 0)], v.to_bytes(4, byteorder='little', signed=True))
+                    else:
+                        prev_sdo_vel = self._last_velocity_sdo.get(slave_pos)
+                        if v != prev_sdo_vel:
+                            logger.info(f"Slave {slave_pos}: {hex(TARGET_VELOCITY_INDEX)} not in PDO; writing vel={v} via SDO")
+                            try:
+                                self.master.sdo_download(slave_pos, TARGET_VELOCITY_INDEX, 0, v.to_bytes(4, 'little', signed=True))
+                                self._last_velocity_sdo[slave_pos] = v
+                            except Exception as e:
+                                logger.error(f"SDO write {hex(TARGET_VELOCITY_INDEX)} failed: {e}")
+                    if mode_eff != MODE_PT and self._pv_pulse_pending.get(slave_pos, False) and self._pv_pulse_active.get(slave_pos, False):
+                        self._pv_pulse_pending[slave_pos] = False
 
             torque = self.last_torque_cmd.get(slave_pos)
             if motion_ok and torque is not None:
@@ -771,7 +803,7 @@ class EtherCATProcess:
             else:
                 pos = self.last_position_cmd.get(slave_pos)
 
-            if motion_ok and pos is not None:
+            if motion_ok and pos is not None and mode_eff != MODE_PT:
                 p = int(pos)
                 if (TARGET_POSITION_INDEX, 0) in entries:
                     self.master.write_domain(self.domain, entries[(TARGET_POSITION_INDEX, 0)], p.to_bytes(4, byteorder='little', signed=True))
@@ -880,12 +912,15 @@ class EtherCATProcess:
                     
                     self.master.write_domain(self.domain, cw_offset, cw.to_bytes(2, byteorder='little'))
 
-            # Touch probe arming maintenance (write-once behavior)
-            probe_val = self.last_probe_arm.get(slave_pos)
-            if probe_val is not None:
-                if (PROBE_FUNCTION_INDEX, 0) in entries:
-                    self.master.write_domain(self.domain, entries[(PROBE_FUNCTION_INDEX, 0)], probe_val.to_bytes(2, 'little'))
-                else:
+            if (PROBE_FUNCTION_INDEX, 0) in entries:
+                probe_val = self.last_probe_arm.get(slave_pos)
+                val = (int(probe_val) if probe_val is not None else 0).to_bytes(2, 'little')
+                self.master.write_domain(self.domain, entries[(PROBE_FUNCTION_INDEX, 0)], val)
+                if probe_val is not None:
+                    self.last_probe_arm[slave_pos] = None
+            else:
+                probe_val = self.last_probe_arm.get(slave_pos)
+                if probe_val is not None:
                     warned = self.warned_missing_pdo.setdefault(slave_pos, set())
                     key = (PROBE_FUNCTION_INDEX, 0)
                     if key not in warned:
@@ -895,8 +930,7 @@ class EtherCATProcess:
                         self.master.sdo_download(slave_pos, PROBE_FUNCTION_INDEX, 0, probe_val.to_bytes(2, 'little'))
                     except Exception as e:
                         logger.error(f"SDO write {hex(PROBE_FUNCTION_INDEX)} failed: {e}")
-                # Clear after one write
-                self.last_probe_arm[slave_pos] = None
+                    self.last_probe_arm[slave_pos] = None
 
     def _update_ruckig(self) -> None:
         """
