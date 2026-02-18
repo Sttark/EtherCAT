@@ -190,6 +190,7 @@ class RuckigCspPlanner:
             "dt": dt,
             "lookahead_s": lookahead,
             "error": None,
+            "position_offset": 0,
         }
 
     def step(
@@ -216,10 +217,17 @@ class RuckigCspPlanner:
             otg = s["otg"]
 
             if s.get("mode") == "velocity":
-                # Keep target position ahead so Ruckig can converge to a steady velocity without "finishing."
                 tv = float(s.get("target_velocity") or 0.0)
                 lookahead = float(s.get("lookahead_s") or 0.5)
                 cur_pos = float(inp.current_position[0])
+
+                if abs(cur_pos) > 1_000_000_000:
+                    shift = int(round(cur_pos))
+                    inp.current_position = [cur_pos - shift]
+                    inp.target_position = [float(inp.target_position[0]) - shift]
+                    s["position_offset"] = s.get("position_offset", 0) + shift
+                    cur_pos = float(inp.current_position[0])
+
                 inp.target_velocity = [tv]
                 inp.target_acceleration = [0.0]
                 inp.target_position = [cur_pos + (tv * lookahead)]
@@ -227,7 +235,6 @@ class RuckigCspPlanner:
             res = otg.update(inp, out)
             done = self._is_finished(res)
 
-            # Advance state for next call (binding-dependent helper preferred)
             if hasattr(out, "pass_to_input"):
                 out.pass_to_input(inp)
             else:
@@ -235,7 +242,8 @@ class RuckigCspPlanner:
                 inp.current_velocity = list(out.new_velocity)
                 inp.current_acceleration = list(out.new_acceleration)
 
-            pos = int(round(float(out.new_position[0])))
+            offset = s.get("position_offset", 0)
+            pos = int(round(float(out.new_position[0]))) + offset
             vel = float(out.new_velocity[0])
             acc = float(out.new_acceleration[0])
 

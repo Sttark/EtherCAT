@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 AL_STATE_OP = 0x08
 
 
+def _wrap_i32(v: int) -> int:
+    return ((v + 0x8000_0000) % 0x1_0000_0000) - 0x8000_0000
+
+
 class EtherCATProcess:
     def _install_signal_handlers(self) -> None:
         """
@@ -806,7 +810,7 @@ class EtherCATProcess:
                 pos = self.last_position_cmd.get(slave_pos)
 
             if mode_eff == MODE_CSP and pos is not None and (TARGET_POSITION_INDEX, 0) in entries:
-                p = int(pos)
+                p = _wrap_i32(int(pos))
                 self.master.write_domain(self.domain, entries[(TARGET_POSITION_INDEX, 0)], p.to_bytes(4, byteorder='little', signed=True))
             elif motion_ok and pos is not None and mode_eff != MODE_PT:
                 p = int(pos)
@@ -1035,7 +1039,7 @@ class EtherCATProcess:
             # Step active planner
             step = self._ruckig_planner.step(pos, actual_position=actual_position, actual_velocity=actual_velocity)
             if step is not None:
-                self._csp_target_next[pos] = int(step.position)
+                self._csp_target_next[pos] = _wrap_i32(int(step.position))
 
     def run(self):
         try:
