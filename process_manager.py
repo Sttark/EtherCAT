@@ -796,14 +796,19 @@ class EtherCATProcess:
             pos = None
             mode_eff = mode if mode is not None else self._default_mode.get(slave_pos)
             if mode_eff == MODE_CSP:
-                # Atomic swap: update current target at cycle boundary if a new one arrived
                 if slave_pos in self._csp_target_next:
                     self._csp_target_cur[slave_pos] = self._csp_target_next.get(slave_pos)
                 pos = self._csp_target_cur.get(slave_pos)
+                if pos is None and (POSITION_ACTUAL_INDEX, 0) in entries:
+                    raw_p = self.master.read_domain(self.domain, entries[(POSITION_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                    pos = int.from_bytes(raw_p, "little", signed=True)
             else:
                 pos = self.last_position_cmd.get(slave_pos)
 
-            if motion_ok and pos is not None and mode_eff != MODE_PT:
+            if mode_eff == MODE_CSP and pos is not None and (TARGET_POSITION_INDEX, 0) in entries:
+                p = int(pos)
+                self.master.write_domain(self.domain, entries[(TARGET_POSITION_INDEX, 0)], p.to_bytes(4, byteorder='little', signed=True))
+            elif motion_ok and pos is not None and mode_eff != MODE_PT:
                 p = int(pos)
                 if (TARGET_POSITION_INDEX, 0) in entries:
                     self.master.write_domain(self.domain, entries[(TARGET_POSITION_INDEX, 0)], p.to_bytes(4, byteorder='little', signed=True))
