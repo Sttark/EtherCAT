@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 from ..commands import CommandType
-from ..constants import MODE_PP, MODE_PV, MODE_CSP
+from ..constants import MODE_PP, MODE_PV, MODE_PT, MODE_CSP
 from ..utils.checks import nonblocking_check
 
 
@@ -46,6 +46,11 @@ class CiA402Drive:
         self._queue(CommandType.SET_VELOCITY_MODE)
         return True
 
+    @nonblocking_check(name="set_torque_mode", timeout_s=1.0)
+    def set_torque_mode(self, safe_switch: bool = False) -> bool:
+        self._queue(CommandType.SET_TORQUE_MODE)
+        return True
+
     @nonblocking_check(name="set_csp_mode", timeout_s=1.0)
     def set_csp_mode(self, safe_switch: bool = False) -> bool:
         self._queue(CommandType.SET_CSP_MODE)
@@ -54,6 +59,15 @@ class CiA402Drive:
     # Motion
     def set_velocity(self, velocity: float, unit: str = 'native') -> bool:
         self._queue(CommandType.SET_VELOCITY, value=velocity, params={'unit': unit})
+        return True
+
+    def set_torque(self, torque: float, unit: str = 'native') -> bool:
+        self._queue(CommandType.SET_TORQUE, value=torque, params={'unit': unit})
+        return True
+
+    def set_max_torque(self, max_torque: int) -> bool:
+        data = max_torque.to_bytes(2, 'little', signed=False)
+        self._queue(CommandType.WRITE_SDO, value=data, params={"index": 0x6072, "subindex": 0})
         return True
 
     def stop_moving(self) -> bool:
@@ -203,6 +217,9 @@ class CiA402Drive:
     def get_velocity(self, unit: str = 'native') -> Optional[float]:
         return self._read_status_field('velocity_actual')
 
+    def get_torque(self, unit: str = 'native') -> Optional[float]:
+        return self._read_status_field('torque_actual')
+
     # Internal helpers delegated to the process runtime via injection
     def _queue(self, cmd_type: CommandType, value: Optional[float] = None, params: Optional[Dict] = None) -> None:
         if not hasattr(self, '_enqueue_command'):
@@ -232,6 +249,11 @@ class CiA402Drive:
             if mode is None:
                 return True
             return mode == MODE_PV
+        if intent['type'] == CommandType.SET_TORQUE_MODE:
+            mode = self._read_status_field('mode_display')
+            if mode is None:
+                return True
+            return mode == MODE_PT
         if intent['type'] == CommandType.SET_CSP_MODE:
             mode = self._read_status_field('mode_display')
             if mode is None:
