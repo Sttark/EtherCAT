@@ -133,6 +133,14 @@ class ec_slave_info_t(ctypes.Structure):
     ]
 
 
+class ec_slave_config_state_t(ctypes.Structure):
+    _fields_ = [
+        ("online", ctypes.c_uint, 1),
+        ("operational", ctypes.c_uint, 1),
+        ("al_state", ctypes.c_uint, 4),
+    ]
+
+
 # Define function prototypes if library is available
 if _libec:
     _libec.ecrt_open_master.argtypes = [ctypes.c_uint]
@@ -261,6 +269,12 @@ if _libec:
     ]
     _libec.ecrt_slave_config_sdo.restype = ctypes.c_int
 
+    _libec.ecrt_slave_config_state.argtypes = [
+        ctypes.POINTER(ec_slave_config_t),
+        ctypes.POINTER(ec_slave_config_state_t)
+    ]
+    _libec.ecrt_slave_config_state.restype = None
+
     _libec.ecrt_master_select_reference_clock.argtypes = [
         ctypes.POINTER(ec_master_t),
         ctypes.POINTER(ec_slave_config_t)
@@ -313,6 +327,17 @@ class SlaveConfig:
             logger.error(f"Failed to register 0x{index:04X}:{subindex}, code: {offset}")
             return None
         return offset
+
+    def get_state(self) -> Optional[dict]:
+        if not self._config_handle:
+            return None
+        state = ec_slave_config_state_t()
+        _libec.ecrt_slave_config_state(self._config_handle, ctypes.byref(state))
+        return {
+            'online': bool(state.online),
+            'operational': bool(state.operational),
+            'al_state': int(state.al_state),
+        }
 
     def config_dc(self, assign_activate: int, sync0_cycle_time_ns: int,
                   sync0_shift_ns: int = 0, sync1_cycle_time_ns: int = 0,

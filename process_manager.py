@@ -626,6 +626,13 @@ class EtherCATProcess:
         for slave_pos, entries in self.offsets.items():
             drive = {}
             drive['in_op'] = self.slave_in_op.get(slave_pos, False)
+            sc = self.slave_handles.get(slave_pos)
+            if sc is not None:
+                sc_state = sc.get_state()
+                if sc_state:
+                    drive['al_state'] = sc_state.get('al_state', 0)
+                    drive['online'] = sc_state.get('online', False)
+                    drive['operational'] = sc_state.get('operational', False)
 
             if slave_pos not in self._cia402_positions:
                 dcfg = next((d for d in self.cfg.slaves if d.position == slave_pos), None)
@@ -1095,20 +1102,25 @@ class EtherCATProcess:
                     self.master.process_domain(self.domain)
 
                     wc, wc_state = self.master.domain_state(self.domain)
-                    all_op_now = (wc_state == 2)
                     for pos in self.slave_in_op:
+                        sc = self.slave_handles.get(pos)
+                        if sc is None:
+                            continue
+                        sc_state = sc.get_state()
+                        is_op = sc_state is not None and sc_state.get('operational', False)
                         was_op = self.slave_in_op[pos]
-                        if all_op_now and not was_op:
+                        if is_op and not was_op:
                             self.slave_in_op[pos] = True
-                            logger.info(f"Slave {pos} entered OP (domain WC={wc}, state=complete)")
-                        elif not all_op_now and was_op:
+                            logger.info(f"Slave {pos} entered OP (al_state=0x{sc_state.get('al_state', 0):02X})")
+                        elif not is_op and was_op:
                             self.slave_in_op[pos] = False
                             self.drive_enabled[pos] = False
                             self.desired_controlword.pop(pos, None)
                             self._pp_pulse_active[pos] = False
                             self._pp_pulse_start_ns[pos] = None
                             self._pp_pulse_pending[pos] = False
-                            logger.warning(f"Slave {pos} left OP (domain WC={wc}, state={wc_state})")
+                            al = sc_state.get('al_state', 0) if sc_state else 0
+                            logger.warning(f"Slave {pos} left OP (al_state=0x{al:02X}, domain WC={wc})")
 
                     if self._activated_mono_ns is not None:
                         elapsed_s = (time.monotonic_ns() - self._activated_mono_ns) / 1_000_000_000.0
