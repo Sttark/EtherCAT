@@ -16,7 +16,7 @@ from .constants import (
     MODES_OP_INDEX, MODES_OP_DISPLAY_INDEX,
     TARGET_POSITION_INDEX, TARGET_VELOCITY_INDEX, TARGET_TORQUE_INDEX, MAX_TORQUE_INDEX,
     POSITION_ACTUAL_INDEX, VELOCITY_ACTUAL_INDEX, TORQUE_ACTUAL_INDEX,
-    PROBE_FUNCTION_INDEX, PROBE_STATUS_INDEX, PROBE_POS1_INDEX, PROBE_POS2_INDEX, PROBE_POS2_ALT_INDEX, DIGITAL_INPUTS_INDEX,
+    PROBE_FUNCTION_INDEX, PROBE_STATUS_INDEX, PROBE_POS1_INDEX, PROBE_POS2_INDEX, PROBE_POS2_ALT_INDEX, DIGITAL_INPUTS_INDEX, DIP_IN_STATE_INDEX,
     ERROR_CODE_INDEX,
     MODE_PP, MODE_PV, MODE_PT, MODE_CSP, MODE_HM,
     CW_BIT_NEW_SET_POINT, CW_BIT_CHANGE_IMMEDIATELY, CW_BIT_ABS_REL, CW_BIT_HALT, CW_ENABLE_OP_SIMPLIFIED,
@@ -865,6 +865,9 @@ class EtherCATProcess:
             if (DIGITAL_INPUTS_INDEX, 0) in entries:
                 raw = self.master.read_domain(self.domain, entries[(DIGITAL_INPUTS_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
                 drive['digital_inputs'] = int.from_bytes(raw, 'little')
+            if (DIP_IN_STATE_INDEX, 1) in entries:
+                raw = self.master.read_domain(self.domain, entries[(DIP_IN_STATE_INDEX, 1)], 4) or b"\x00\x00\x00\x00"
+                drive['dip_in_state'] = int.from_bytes(raw, 'little')
             if (ERROR_CODE_INDEX, 0) in entries:
                 raw = self.master.read_domain(self.domain, entries[(ERROR_CODE_INDEX, 0)], 2) or b"\x00\x00"
                 drive['error_code'] = int.from_bytes(raw, 'little')

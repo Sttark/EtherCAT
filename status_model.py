@@ -11,6 +11,7 @@ class DriveStatus:
     velocity_actual: Optional[float] = None
     error_code: Optional[int] = None
     digital_inputs: Optional[int] = None
+    dip_in_state: Optional[int] = None
     probe_enabled: bool = False
     probe_active: bool = False
     probe_pos1: Optional[float] = None
