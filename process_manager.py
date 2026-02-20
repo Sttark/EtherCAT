@@ -141,6 +141,7 @@ class EtherCATProcess:
         self._ruckig_last_error: Dict[int, Optional[str]] = {}
         self._ruckig_trace: Dict[int, Dict[str, Any]] = {}
         self._ruckig_prev_actual_position: Dict[int, int] = {}
+        self._ruckig_prev_sample_cycle: Dict[int, int] = {}
         self._semi_rotary_rt: Dict[str, Any] = {
             "active": False,
             "die_pos": None,
@@ -1288,13 +1289,23 @@ class EtherCATProcess:
             raw_p = self.master.read_domain(self.domain, entries[(POSITION_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
             raw_v = self.master.read_domain(self.domain, entries[(VELOCITY_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
             actual_position = int.from_bytes(raw_p, "little", signed=True)
-            actual_velocity = float(int.from_bytes(raw_v, "little", signed=True))
+            actual_velocity_drive = float(int.from_bytes(raw_v, "little", signed=True))
             prev_actual = self._ruckig_prev_actual_position.get(pos)
             measured_delta = None if prev_actual is None else int(actual_position - prev_actual)
+            prev_cycle = self._ruckig_prev_sample_cycle.get(pos)
+            sample_is_fresh = prev_cycle is not None and (int(self.cycle_count) - int(prev_cycle) == 1)
             self._ruckig_prev_actual_position[pos] = int(actual_position)
+            self._ruckig_prev_sample_cycle[pos] = int(self.cycle_count)
+            actual_velocity_estimated = (
+                float(measured_delta) / dt_s_fallback
+                if measured_delta is not None and sample_is_fresh
+                else actual_velocity_drive
+            )
             trace = self._ruckig_trace.setdefault(pos, {})
             trace["measured_position_actual"] = int(actual_position)
-            trace["measured_velocity_actual"] = float(actual_velocity)
+            trace["measured_velocity_actual"] = float(actual_velocity_drive)
+            trace["measured_velocity_estimated"] = float(actual_velocity_estimated)
+            trace["measured_velocity_estimate_fresh"] = bool(sample_is_fresh)
             trace["measured_position_delta"] = measured_delta
             trace["cycle_time_s"] = dt_s_fallback
             trace["drive_max_velocity_config"] = getattr(dcfg, "max_velocity", None)
@@ -1331,7 +1342,7 @@ class EtherCATProcess:
                         self._ruckig_planner.start_position(
                             pos,
                             actual_position=actual_position,
-                            actual_velocity=actual_velocity,
+                            actual_velocity=actual_velocity_drive,
                             target_position=int(req.get("target")),
                             cfg=cfg,
                             dt_s_fallback=dt_s_fallback,
@@ -1346,7 +1357,7 @@ class EtherCATProcess:
                         self._ruckig_planner.start_velocity(
                             pos,
                             actual_position=actual_position,
-                            actual_velocity=actual_velocity,
+                            actual_velocity=actual_velocity_estimated,
                             target_velocity=float(req.get("target")),
                             cfg=cfg,
                             dt_s_fallback=dt_s_fallback,
@@ -1364,7 +1375,7 @@ class EtherCATProcess:
                     self._ruckig_requests.pop(pos, None)
 
             # Step active planner
-            step = self._ruckig_planner.step(pos, actual_position=actual_position, actual_velocity=actual_velocity)
+            step = self._ruckig_planner.step(pos, actual_position=actual_position, actual_velocity=actual_velocity_drive)
             if step is not None:
                 csp_target = _wrap_i32(int(step.position))
                 prev_csp = self._csp_target_cur.get(pos)
