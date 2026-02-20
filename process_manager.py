@@ -141,6 +141,34 @@ class EtherCATProcess:
         self._ruckig_last_error: Dict[int, Optional[str]] = {}
         self._ruckig_trace: Dict[int, Dict[str, Any]] = {}
         self._ruckig_prev_actual_position: Dict[int, int] = {}
+        self._semi_rotary_rt: Dict[str, Any] = {
+            "active": False,
+            "die_pos": None,
+            "shuttle_pos": None,
+            "nip_in_pos": None,
+            "nip_out_pos": None,
+            "die_start": 0,
+            "shuttle_center": 0,
+            "nip_in_start": 0,
+            "nip_out_start": 0,
+            "die_counts_per_rev": 0.0,
+            "nip_in_counts_per_rev": 0.0,
+            "nip_out_counts_per_rev": 0.0,
+            "comp_counts": [],
+            "n_samples": 0,
+            "blend_cycles": 0,
+            "cycle_count": 0,
+            "max_shuttle_delta_per_cycle": None,
+            "max_shuttle_excursion": None,
+            "enable_nips": False,
+            "error": None,
+            "die_phase_rt": None,
+            "comp_target_rt": None,
+            "comp_target_delta_rt": None,
+            "rev_count_rt": None,
+            "blend_rt": None,
+            "comp_raw_rt": None,
+        }
 
     @staticmethod
     def _percentile_value(values: List[int], percentile: float) -> Optional[int]:
@@ -462,6 +490,8 @@ class EtherCATProcess:
                 CommandType.SET_TORQUE,
                 CommandType.START_RUCKIG_POSITION,
                 CommandType.START_RUCKIG_VELOCITY,
+                CommandType.START_SEMI_ROTARY_RT,
+                CommandType.UPDATE_SEMI_ROTARY_RT,
                 CommandType.ENABLE_DRIVE,
             }
             if cmd.type in blocked:
@@ -557,6 +587,67 @@ class EtherCATProcess:
             self._ruckig_requests.pop(cmd.target_id, None)
             if self._ruckig_planner:
                 self._ruckig_planner.stop(cmd.target_id)
+        elif cmd.type == CommandType.START_SEMI_ROTARY_RT:
+            params = dict(cmd.params or {})
+            try:
+                comp_counts = params.get("comp_counts") or []
+                n_samples = int(params.get("n_samples") or len(comp_counts))
+                if not comp_counts or n_samples <= 0:
+                    raise ValueError("comp_counts/n_samples required")
+                die_pos = int(params["die_pos"])
+                shuttle_pos = int(params["shuttle_pos"])
+                self._semi_rotary_rt = {
+                    "active": True,
+                    "die_pos": die_pos,
+                    "shuttle_pos": shuttle_pos,
+                    "nip_in_pos": params.get("nip_in_pos"),
+                    "nip_out_pos": params.get("nip_out_pos"),
+                    "die_start": int(params["die_start"]),
+                    "shuttle_center": int(params["shuttle_center"]),
+                    "nip_in_start": int(params.get("nip_in_start") or 0),
+                    "nip_out_start": int(params.get("nip_out_start") or 0),
+                    "die_counts_per_rev": float(params["die_counts_per_rev"]),
+                    "nip_in_counts_per_rev": float(params.get("nip_in_counts_per_rev") or 0.0),
+                    "nip_out_counts_per_rev": float(params.get("nip_out_counts_per_rev") or 0.0),
+                    "comp_counts": [int(v) for v in comp_counts],
+                    "n_samples": n_samples,
+                    "blend_cycles": int(params.get("blend_cycles") or 0),
+                    "cycle_count": 0,
+                    "max_shuttle_delta_per_cycle": params.get("max_shuttle_delta_per_cycle"),
+                    "max_shuttle_excursion": params.get("max_shuttle_excursion"),
+                    "enable_nips": bool(params.get("enable_nips", False)),
+                    "error": None,
+                    "die_phase_rt": None,
+                    "comp_target_rt": None,
+                    "comp_target_delta_rt": None,
+                    "rev_count_rt": None,
+                    "blend_rt": None,
+                    "comp_raw_rt": None,
+                }
+                self.last_mode_cmd[die_pos] = MODE_CSP
+                self.last_mode_cmd[shuttle_pos] = MODE_CSP
+                self._ruckig_last_error[die_pos] = None
+            except Exception as e:
+                self._semi_rotary_rt["active"] = False
+                self._semi_rotary_rt["error"] = str(e)
+        elif cmd.type == CommandType.UPDATE_SEMI_ROTARY_RT:
+            params = dict(cmd.params or {})
+            if self._semi_rotary_rt.get("active"):
+                if "comp_counts" in params and params["comp_counts"]:
+                    self._semi_rotary_rt["comp_counts"] = [int(v) for v in params["comp_counts"]]
+                    self._semi_rotary_rt["n_samples"] = int(params.get("n_samples") or len(self._semi_rotary_rt["comp_counts"]))
+                for key in (
+                    "blend_cycles",
+                    "max_shuttle_delta_per_cycle",
+                    "max_shuttle_excursion",
+                    "enable_nips",
+                    "nip_in_counts_per_rev",
+                    "nip_out_counts_per_rev",
+                ):
+                    if key in params:
+                        self._semi_rotary_rt[key] = params[key]
+        elif cmd.type == CommandType.STOP_SEMI_ROTARY_RT:
+            self._semi_rotary_rt["active"] = False
         elif cmd.type == CommandType.DISABLE_PROBE:
             # Clear probe function on device (will be applied once in cyclic)
             self.last_probe_arm[cmd.target_id] = 0
@@ -786,6 +877,19 @@ class EtherCATProcess:
                 rt = self._ruckig_trace.get(slave_pos)
                 if rt is not None:
                     drive["ruckig_trace"] = dict(rt)
+            semi_rt = self._semi_rotary_rt
+            if slave_pos == semi_rt.get("shuttle_pos") or slave_pos == semi_rt.get("die_pos"):
+                drive["semi_rotary_rt"] = {
+                    "active": bool(semi_rt.get("active")),
+                    "error": semi_rt.get("error"),
+                    "die_phase_rt": semi_rt.get("die_phase_rt"),
+                    "comp_target_rt": semi_rt.get("comp_target_rt"),
+                    "comp_target_delta_rt": semi_rt.get("comp_target_delta_rt"),
+                    "rev_count_rt": semi_rt.get("rev_count_rt"),
+                    "blend_rt": semi_rt.get("blend_rt"),
+                    "comp_raw_rt": semi_rt.get("comp_raw_rt"),
+                    "cycle_count_rt": semi_rt.get("cycle_count"),
+                }
             # Publish PDO map health (presence)
             pdo_health = {}
             for key_idx in [MODES_OP_INDEX, MODES_OP_DISPLAY_INDEX, CW_INDEX, SW_INDEX, TARGET_VELOCITY_INDEX, TARGET_POSITION_INDEX]:
@@ -1031,6 +1135,111 @@ class EtherCATProcess:
                     except Exception as e:
                         logger.error(f"SDO write {hex(PROBE_FUNCTION_INDEX)} failed: {e}")
                     self.last_probe_arm[slave_pos] = None
+
+    def _update_semi_rotary_rt(self) -> None:
+        rt = self._semi_rotary_rt
+        if not rt.get("active"):
+            return
+        if self.cfg.sdo_only or self.domain is None:
+            return
+
+        die_pos = rt.get("die_pos")
+        shuttle_pos = rt.get("shuttle_pos")
+        if die_pos is None or shuttle_pos is None:
+            rt["error"] = "die_pos/shuttle_pos not configured"
+            rt["active"] = False
+            return
+
+        if not self.drive_enabled.get(die_pos, False) or self._manual_disable.get(die_pos, False):
+            return
+        if not self.drive_enabled.get(shuttle_pos, False) or self._manual_disable.get(shuttle_pos, False):
+            return
+
+        die_entries = self.offsets.get(die_pos, {})
+        if (POSITION_ACTUAL_INDEX, 0) not in die_entries:
+            rt["error"] = "die position_actual PDO missing"
+            rt["active"] = False
+            return
+
+        raw = self.master.read_domain(self.domain, die_entries[(POSITION_ACTUAL_INDEX, 0)], 4)
+        if not raw:
+            return
+        die_actual = int.from_bytes(raw, "little", signed=True)
+        die_elapsed = die_actual - int(rt.get("die_start", 0))
+        counts_per_rev = float(rt.get("die_counts_per_rev", 0.0))
+        abs_counts_per_rev = abs(counts_per_rev)
+        if abs_counts_per_rev <= 0.0:
+            rt["error"] = "die_counts_per_rev must be non-zero"
+            rt["active"] = False
+            return
+
+        if counts_per_rev < 0:
+            die_phase = ((-die_elapsed) % abs_counts_per_rev) / abs_counts_per_rev
+        else:
+            die_phase = (die_elapsed % abs_counts_per_rev) / abs_counts_per_rev
+
+        comp_counts = rt.get("comp_counts") or []
+        n_samples = int(rt.get("n_samples") or len(comp_counts))
+        if not comp_counts or n_samples <= 0:
+            rt["error"] = "empty comp_counts"
+            rt["active"] = False
+            return
+        idx = int(die_phase * n_samples)
+        if idx >= n_samples:
+            idx = n_samples - 1
+        comp_raw = int(comp_counts[idx])
+
+        cycle_count = int(rt.get("cycle_count", 0))
+        blend_cycles = int(rt.get("blend_cycles", 0))
+        blend = 1.0 if blend_cycles <= 0 else min(1.0, float(cycle_count) / float(blend_cycles))
+
+        shuttle_center = int(rt.get("shuttle_center", 0))
+        comp_target = shuttle_center + int(comp_raw * blend)
+
+        max_excursion = rt.get("max_shuttle_excursion")
+        if max_excursion is not None:
+            max_exc = abs(int(max_excursion))
+            lo = shuttle_center - max_exc
+            hi = shuttle_center + max_exc
+            if comp_target < lo:
+                comp_target = lo
+            elif comp_target > hi:
+                comp_target = hi
+
+        prev_target = rt.get("comp_target_rt")
+        target_delta = None
+        if prev_target is not None:
+            target_delta = int(comp_target) - int(prev_target)
+            max_delta = rt.get("max_shuttle_delta_per_cycle")
+            if max_delta is not None:
+                lim = abs(int(max_delta))
+                if abs(target_delta) > lim:
+                    comp_target = int(prev_target) + (lim if target_delta > 0 else -lim)
+                    target_delta = int(comp_target) - int(prev_target)
+
+        rev_count = die_elapsed / counts_per_rev
+        self._csp_target_next[shuttle_pos] = int(comp_target)
+        self.last_mode_cmd[shuttle_pos] = MODE_CSP
+
+        if bool(rt.get("enable_nips", False)):
+            nip_in_pos = rt.get("nip_in_pos")
+            if nip_in_pos is not None and self.drive_enabled.get(nip_in_pos, False) and not self._manual_disable.get(nip_in_pos, False):
+                nip_in_target = int(rt.get("nip_in_start", 0)) + int(rev_count * float(rt.get("nip_in_counts_per_rev", 0.0)))
+                self._csp_target_next[int(nip_in_pos)] = int(nip_in_target)
+                self.last_mode_cmd[int(nip_in_pos)] = MODE_CSP
+            nip_out_pos = rt.get("nip_out_pos")
+            if nip_out_pos is not None and self.drive_enabled.get(nip_out_pos, False) and not self._manual_disable.get(nip_out_pos, False):
+                nip_out_target = int(rt.get("nip_out_start", 0)) + int(rev_count * float(rt.get("nip_out_counts_per_rev", 0.0)))
+                self._csp_target_next[int(nip_out_pos)] = int(nip_out_target)
+                self.last_mode_cmd[int(nip_out_pos)] = MODE_CSP
+
+        rt["die_phase_rt"] = float(die_phase)
+        rt["comp_target_rt"] = int(comp_target)
+        rt["comp_target_delta_rt"] = int(target_delta) if target_delta is not None else None
+        rt["rev_count_rt"] = float(rev_count)
+        rt["blend_rt"] = float(blend)
+        rt["comp_raw_rt"] = int(comp_raw)
+        rt["cycle_count"] = cycle_count + 1
 
     def _update_ruckig(self) -> None:
         """
@@ -1287,6 +1496,7 @@ class EtherCATProcess:
                     if getattr(self.cfg, "auto_enable_cia402", True):
                         self._auto_enable_drives()
                     self._update_ruckig()
+                    self._update_semi_rotary_rt()
                     self._cyclic_write()
 
                     try:
@@ -1300,7 +1510,11 @@ class EtherCATProcess:
                     self.master.send()
 
                 now = time.time()
-                if now - last_status > 0.05:
+                status_period_s = float(getattr(self.cfg, "status_publish_period_s", 0.05))
+                min_period_s = float(self.cfg.cycle_time_ms) / 1000.0
+                if status_period_s < min_period_s:
+                    status_period_s = min_period_s
+                if now - last_status > status_period_s:
                     self._publish_status()
                     last_status = now
 

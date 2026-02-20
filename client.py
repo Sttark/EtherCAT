@@ -17,7 +17,10 @@ class StatusProxy:
 
     def _refresh(self):
         now = time.time()
-        if now - self._last_at > 0.02:
+        refresh_period_s = float(getattr(self._manager.cfg, "status_proxy_refresh_s", 0.02))
+        if refresh_period_s < 0:
+            refresh_period_s = 0.0
+        if now - self._last_at > refresh_period_s:
             latest = self._manager.get_status_snapshot()
             if latest is None:
                 latest = self._manager.get_latest_status()

@@ -24,6 +24,9 @@ class CommandType(Enum):
     START_RUCKIG_POSITION = auto()
     START_RUCKIG_VELOCITY = auto()
     STOP_RUCKIG = auto()
+    START_SEMI_ROTARY_RT = auto()
+    UPDATE_SEMI_ROTARY_RT = auto()
+    STOP_SEMI_ROTARY_RT = auto()
 
     # Drive state
     ENABLE_DRIVE = auto()

@@ -138,6 +138,8 @@ class EthercatNetworkConfig:
     force_disable_on_start: bool = False
     forbid_motion_commands: bool = False
     jitter_window_size: int = 2048
+    status_publish_period_s: float = 0.05
+    status_proxy_refresh_s: float = 0.02
     dc_reference_slave: Optional[int] = None
     slaves: List[DriveConfig] = field(default_factory=list)
 
