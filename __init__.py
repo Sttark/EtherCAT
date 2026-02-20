@@ -9,6 +9,7 @@ add-ons like Ruckig-based motion planning.
 """
 
 __all__ = [
+    "client",
     "config_schema",
     "commands",
     "status_model",

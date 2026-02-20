@@ -1170,6 +1170,7 @@ class EtherCATProcessManager:
         self._status_q: mp.Queue = mp.Queue(maxsize=64)
         self._stop_event: mp.Event = mp.Event()
         self._proc: Optional[mp.Process] = None
+        self._latest_status: Optional[NetworkStatus] = None
 
     def start(self):
         if self._proc and self._proc.is_alive():
@@ -1222,6 +1223,11 @@ class EtherCATProcessManager:
                 latest = self._status_q.get_nowait()
             except queue.Empty:
                 break
+        if latest is not None:
+            self._latest_status = latest
         return latest
+
+    def get_status_snapshot(self) -> Optional[NetworkStatus]:
+        return self._latest_status
 
 
