@@ -1180,14 +1180,24 @@ class EtherCATProcess:
 
         comp_counts = rt.get("comp_counts") or []
         n_samples = int(rt.get("n_samples") or len(comp_counts))
-        if not comp_counts or n_samples <= 0:
+        table_len = len(comp_counts)
+        if table_len <= 0 or n_samples <= 0:
             rt["error"] = "empty comp_counts"
             rt["active"] = False
             return
-        idx = int(die_phase * n_samples)
-        if idx >= n_samples:
-            idx = n_samples - 1
-        comp_raw = int(comp_counts[idx])
+        if n_samples > table_len:
+            n_samples = table_len
+        phase_idx = die_phase * n_samples
+        i0 = int(phase_idx)
+        if i0 >= n_samples:
+            i0 = n_samples - 1
+        frac = phase_idx - float(i0)
+        i1 = i0 + 1
+        if i1 >= n_samples:
+            i1 = 0
+        v0 = float(comp_counts[i0])
+        v1 = float(comp_counts[i1])
+        comp_raw = int(round(v0 + (v1 - v0) * frac))
 
         cycle_count = int(rt.get("cycle_count", 0))
         blend_cycles = int(rt.get("blend_cycles", 0))
