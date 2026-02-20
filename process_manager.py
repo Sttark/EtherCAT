@@ -6,6 +6,7 @@ import signal
 import sys
 import time
 import traceback
+from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
 from .commands import Command, CommandType
@@ -116,11 +117,45 @@ class EtherCATProcess:
         self._cia402_positions: set = set()
         self._raw_pdo_writes: Dict[int, Dict[Tuple[int, int], bytes]] = {}
         self._status_publish_count: int = 0
+        self._last_cycle_time_us: Optional[int] = None
+        self._last_cycle_jitter_us: Optional[int] = None
+        self._max_abs_cycle_jitter_us: int = 0
+        self._jitter_window: deque[int] = deque(maxlen=max(32, int(getattr(self.cfg, "jitter_window_size", 2048))))
+        self._deadline_miss_count: int = 0
+        self._last_domain_wc: Optional[int] = None
+        self._last_domain_wc_state: Optional[int] = None
+        self._domain_wc_min: Optional[int] = None
+        self._domain_wc_max: Optional[int] = None
+        self._motion_command_block_count: int = 0
+        self._op_entered_first_ns: Dict[int, int] = {}
+        self._op_entered_last_ns: Dict[int, int] = {}
+        self._op_left_last_ns: Dict[int, int] = {}
+        self._op_dropout_count: Dict[int, int] = {}
+        self._all_op_first_ns: Optional[int] = None
+        self._all_op_last_ns: Optional[int] = None
+        self._all_left_op_last_ns: Optional[int] = None
 
         # Ruckig (optional CSP trajectory generation)
         self._ruckig_planner: Optional[RuckigCspPlanner] = None
         self._ruckig_requests: Dict[int, Dict[str, Any]] = {}  # slave_pos -> request dict
         self._ruckig_last_error: Dict[int, Optional[str]] = {}
+        self._ruckig_trace: Dict[int, Dict[str, Any]] = {}
+        self._ruckig_prev_actual_position: Dict[int, int] = {}
+
+    @staticmethod
+    def _percentile_value(values: List[int], percentile: float) -> Optional[int]:
+        if not values:
+            return None
+        if percentile <= 0:
+            return values[0]
+        if percentile >= 100:
+            return values[-1]
+        idx = int(round((percentile / 100.0) * (len(values) - 1)))
+        if idx < 0:
+            idx = 0
+        if idx >= len(values):
+            idx = len(values) - 1
+        return values[idx]
 
     def _setup(self) -> bool:
         # Open/request the master with or without PDO based on config
@@ -253,6 +288,7 @@ class EtherCATProcess:
             self.features[dcfg.position] = supports
             self._enable_requested.setdefault(dcfg.position, dcfg.position in self._cia402_positions)
             self._manual_disable.setdefault(dcfg.position, False)
+            self._op_dropout_count.setdefault(dcfg.position, 0)
 
             if dcfg.enable_dc and not self.cfg.sdo_only:
                 cycle_time_ns = int(self.cfg.cycle_time_ms * 1_000_000)
@@ -351,6 +387,12 @@ class EtherCATProcess:
                 self._pp_pulse_pending[dcfg.position] = False
                 self.enable_last_action_ns[dcfg.position] = 0
                 self.enable_step[dcfg.position] = 0
+            if getattr(self.cfg, "force_disable_on_start", False):
+                for pos in self._cia402_positions:
+                    self._manual_disable[pos] = True
+                    self._enable_requested[pos] = False
+                    self.desired_controlword[pos] = 0x0000
+                    self.drive_enabled[pos] = False
 
         return True
 
@@ -407,6 +449,25 @@ class EtherCATProcess:
         logger.info("Graceful shutdown complete - drives disabled")
 
     def _handle_command(self, cmd: Command):
+        if getattr(self.cfg, "forbid_motion_commands", False):
+            blocked = {
+                CommandType.SET_VELOCITY_MODE,
+                CommandType.SET_POSITION_MODE,
+                CommandType.SET_CSP_MODE,
+                CommandType.SET_TORQUE_MODE,
+                CommandType.SET_VELOCITY,
+                CommandType.SET_POSITION,
+                CommandType.SET_POSITION_CSP,
+                CommandType.START_HOMING,
+                CommandType.SET_TORQUE,
+                CommandType.START_RUCKIG_POSITION,
+                CommandType.START_RUCKIG_VELOCITY,
+                CommandType.ENABLE_DRIVE,
+            }
+            if cmd.type in blocked:
+                self._motion_command_block_count += 1
+                logger.warning(f"Blocked command in no-motion mode: {cmd.type.name} target={cmd.target_id}")
+                return
         # Store intent; cyclic writer will realize it via PDO or SDO
         if cmd.type == CommandType.SET_VELOCITY_MODE:
             self.last_mode_cmd[cmd.target_id] = MODE_PV
@@ -622,6 +683,22 @@ class EtherCATProcess:
         status = NetworkStatus(drives={})
         status.timestamp_ns = int(time.time() * 1_000_000_000)
         status.cycle_time_ms_config = self.cfg.cycle_time_ms
+        status.last_cycle_time_us = self._last_cycle_time_us
+        status.last_cycle_jitter_us = self._last_cycle_jitter_us
+        status.max_abs_cycle_jitter_us = self._max_abs_cycle_jitter_us
+        jitter_sorted = sorted(self._jitter_window)
+        status.jitter_p95_us = self._percentile_value(jitter_sorted, 95.0)
+        status.jitter_p99_us = self._percentile_value(jitter_sorted, 99.0)
+        status.jitter_p999_us = self._percentile_value(jitter_sorted, 99.9)
+        status.deadline_miss_count = self._deadline_miss_count
+        status.domain_wc = self._last_domain_wc
+        status.domain_wc_state = self._last_domain_wc_state
+        status.domain_wc_min = self._domain_wc_min
+        status.domain_wc_max = self._domain_wc_max
+        status.motion_command_block_count = self._motion_command_block_count
+        status.all_slaves_op_first_ns = self._all_op_first_ns
+        status.all_slaves_op_last_ns = self._all_op_last_ns
+        status.all_slaves_left_op_last_ns = self._all_left_op_last_ns
         status.sdo_only = self.cfg.sdo_only
         for slave_pos, entries in self.offsets.items():
             drive = {}
@@ -661,6 +738,10 @@ class EtherCATProcess:
                 # Intent flags
                 drive['enable_requested'] = self._enable_requested.get(slave_pos, True)
                 drive['manual_disable'] = self._manual_disable.get(slave_pos, False)
+                drive['op_entered_first_ns'] = self._op_entered_first_ns.get(slave_pos)
+                drive['op_entered_last_ns'] = self._op_entered_last_ns.get(slave_pos)
+                drive['op_left_last_ns'] = self._op_left_last_ns.get(slave_pos)
+                drive['op_dropout_count'] = self._op_dropout_count.get(slave_pos, 0)
             if (MODES_OP_DISPLAY_INDEX, 0) in entries:
                 raw = self.master.read_domain(self.domain, entries[(MODES_OP_DISPLAY_INDEX, 0)], 1) or b"\x00"
                 drive['mode_display'] = raw[0]
@@ -702,6 +783,9 @@ class EtherCATProcess:
                 r = self._ruckig_planner.describe(slave_pos)
                 r["last_error"] = self._ruckig_last_error.get(slave_pos)
                 drive["ruckig"] = r
+                rt = self._ruckig_trace.get(slave_pos)
+                if rt is not None:
+                    drive["ruckig_trace"] = dict(rt)
             # Publish PDO map health (presence)
             pdo_health = {}
             for key_idx in [MODES_OP_INDEX, MODES_OP_DISPLAY_INDEX, CW_INDEX, SW_INDEX, TARGET_VELOCITY_INDEX, TARGET_POSITION_INDEX]:
@@ -986,6 +1070,16 @@ class EtherCATProcess:
             raw_v = self.master.read_domain(self.domain, entries[(VELOCITY_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
             actual_position = int.from_bytes(raw_p, "little", signed=True)
             actual_velocity = float(int.from_bytes(raw_v, "little", signed=True))
+            prev_actual = self._ruckig_prev_actual_position.get(pos)
+            measured_delta = None if prev_actual is None else int(actual_position - prev_actual)
+            self._ruckig_prev_actual_position[pos] = int(actual_position)
+            trace = self._ruckig_trace.setdefault(pos, {})
+            trace["measured_position_actual"] = int(actual_position)
+            trace["measured_velocity_actual"] = float(actual_velocity)
+            trace["measured_position_delta"] = measured_delta
+            trace["cycle_time_s"] = dt_s_fallback
+            trace["drive_max_velocity_config"] = getattr(dcfg, "max_velocity", None)
+            trace["cycle_idx"] = int(self.cycle_count)
 
             # Start request (initialize planner using measured actuals)
             req = self._ruckig_requests.get(pos)
@@ -1013,6 +1107,8 @@ class EtherCATProcess:
 
                 try:
                     if req.get("kind") == "position":
+                        trace["request_kind"] = "position"
+                        trace["request_target_position"] = int(req.get("target"))
                         self._ruckig_planner.start_position(
                             pos,
                             actual_position=actual_position,
@@ -1023,6 +1119,11 @@ class EtherCATProcess:
                             overrides=overrides,
                         )
                     else:
+                        trace["request_kind"] = "velocity"
+                        trace["request_target_velocity"] = float(req.get("target"))
+                        trace["request_max_velocity"] = params.get("max_velocity")
+                        trace["request_max_acceleration"] = params.get("max_acceleration")
+                        trace["request_max_jerk"] = params.get("max_jerk")
                         self._ruckig_planner.start_velocity(
                             pos,
                             actual_position=actual_position,
@@ -1046,7 +1147,19 @@ class EtherCATProcess:
             # Step active planner
             step = self._ruckig_planner.step(pos, actual_position=actual_position, actual_velocity=actual_velocity)
             if step is not None:
-                self._csp_target_next[pos] = _wrap_i32(int(step.position))
+                csp_target = _wrap_i32(int(step.position))
+                prev_csp = self._csp_target_cur.get(pos)
+                self._csp_target_next[pos] = csp_target
+                trace["generated_csp_target"] = int(csp_target)
+                trace["generated_csp_delta"] = None if prev_csp is None else int(csp_target - int(prev_csp))
+                trace["generated_velocity"] = float(step.velocity)
+                trace["generated_acceleration"] = float(step.acceleration)
+                trace["planner_done"] = bool(step.done)
+            else:
+                step_error = self._ruckig_planner.consume_last_error(pos)
+                if step_error:
+                    self._ruckig_last_error[pos] = f"trajectory solve failed: {step_error}"
+                    trace["step_error"] = step_error
 
     def run(self):
         try:
@@ -1084,8 +1197,31 @@ class EtherCATProcess:
         next_cycle_mono = mono_base
 
         last_status = 0.0
+        prev_cycle_start_mono = time.monotonic_ns()
+        last_timing_log_mono = prev_cycle_start_mono
         try:
             while not self.stop_event.is_set():
+                cycle_start_mono = time.monotonic_ns()
+                actual_cycle_ns = cycle_start_mono - prev_cycle_start_mono
+                prev_cycle_start_mono = cycle_start_mono
+                self._last_cycle_time_us = int(actual_cycle_ns / 1000)
+                cycle_jitter_ns = actual_cycle_ns - cycle_ns
+                self._last_cycle_jitter_us = int(cycle_jitter_ns / 1000)
+                self._jitter_window.append(self._last_cycle_jitter_us)
+                max_abs_cycle_jitter_us = int(abs(cycle_jitter_ns) / 1000)
+                if max_abs_cycle_jitter_us > self._max_abs_cycle_jitter_us:
+                    self._max_abs_cycle_jitter_us = max_abs_cycle_jitter_us
+                if cycle_start_mono > next_cycle_mono:
+                    self._deadline_miss_count += 1
+                if cycle_start_mono - last_timing_log_mono >= 1_000_000_000:
+                    sys.stderr.write(
+                        f"[EC] loop timing: target_us={int(cycle_ns / 1000)} "
+                        f"actual_us={self._last_cycle_time_us} "
+                        f"jitter_us={self._last_cycle_jitter_us} "
+                        f"max_abs_jitter_us={self._max_abs_cycle_jitter_us}\n"
+                    )
+                    sys.stderr.flush()
+                    last_timing_log_mono = cycle_start_mono
                 self.cycle_count += 1
                 next_cycle_mono += cycle_ns
                 scheduled_wall_ns = wall_base + (next_cycle_mono - mono_base)
@@ -1102,6 +1238,12 @@ class EtherCATProcess:
                     self.master.process_domain(self.domain)
 
                     wc, wc_state = self.master.domain_state(self.domain)
+                    self._last_domain_wc = wc
+                    self._last_domain_wc_state = wc_state
+                    if self._domain_wc_min is None or wc < self._domain_wc_min:
+                        self._domain_wc_min = wc
+                    if self._domain_wc_max is None or wc > self._domain_wc_max:
+                        self._domain_wc_max = wc
                     for pos in self.slave_in_op:
                         sc = self.slave_handles.get(pos)
                         if sc is None:
@@ -1112,6 +1254,9 @@ class EtherCATProcess:
                         if is_op and not was_op:
                             self.slave_in_op[pos] = True
                             logger.info(f"Slave {pos} entered OP (al_state=0x{sc_state.get('al_state', 0):02X})")
+                            if pos not in self._op_entered_first_ns:
+                                self._op_entered_first_ns[pos] = cycle_start_mono
+                            self._op_entered_last_ns[pos] = cycle_start_mono
                         elif not is_op and was_op:
                             self.slave_in_op[pos] = False
                             self.drive_enabled[pos] = False
@@ -1121,6 +1266,16 @@ class EtherCATProcess:
                             self._pp_pulse_pending[pos] = False
                             al = sc_state.get('al_state', 0) if sc_state else 0
                             logger.warning(f"Slave {pos} left OP (al_state=0x{al:02X}, domain WC={wc})")
+                            self._op_left_last_ns[pos] = cycle_start_mono
+                            self._op_dropout_count[pos] = int(self._op_dropout_count.get(pos, 0)) + 1
+
+                    all_in_op = bool(self.slave_in_op) and all(self.slave_in_op.values())
+                    if all_in_op:
+                        if self._all_op_first_ns is None:
+                            self._all_op_first_ns = cycle_start_mono
+                        self._all_op_last_ns = cycle_start_mono
+                    else:
+                        self._all_left_op_last_ns = cycle_start_mono
 
                     if self._activated_mono_ns is not None:
                         elapsed_s = (time.monotonic_ns() - self._activated_mono_ns) / 1_000_000_000.0
@@ -1129,7 +1284,8 @@ class EtherCATProcess:
                             if not_op:
                                 raise RuntimeError(f"OP timeout after {self.cfg.op_timeout_s}s. Not in OP: {not_op}. Domain WC={wc}, state={wc_state}")
 
-                    self._auto_enable_drives()
+                    if getattr(self.cfg, "auto_enable_cia402", True):
+                        self._auto_enable_drives()
                     self._update_ruckig()
                     self._cyclic_write()
 

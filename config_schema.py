@@ -134,6 +134,10 @@ class EthercatNetworkConfig:
     # Bit 12 (0x1000) is commonly "set-point acknowledged" in CiA402 PP.
     pp_ack_mask: int = 0x1000
     pp_ack_timeout_ms: float = 100.0
+    auto_enable_cia402: bool = True
+    force_disable_on_start: bool = False
+    forbid_motion_commands: bool = False
+    jitter_window_size: int = 2048
     dc_reference_slave: Optional[int] = None
     slaves: List[DriveConfig] = field(default_factory=list)
 

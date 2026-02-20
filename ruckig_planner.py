@@ -39,6 +39,7 @@ class RuckigCspPlanner:
 
         # slave_pos -> state
         self._state: Dict[int, Dict[str, Any]] = {}
+        self._last_error: Dict[int, str] = {}
 
     def _load_ruckig(self) -> None:
         try:
@@ -102,6 +103,9 @@ class RuckigCspPlanner:
             "error": s.get("error"),
         }
 
+    def consume_last_error(self, slave_pos: int) -> Optional[str]:
+        return self._last_error.pop(slave_pos, None)
+
     def start_position(
         self,
         slave_pos: int,
@@ -114,6 +118,7 @@ class RuckigCspPlanner:
         overrides: Optional[Dict[str, Optional[float]]] = None,
     ) -> None:
         self._require()
+        self._last_error.pop(slave_pos, None)
         dt = self._dt_s(cfg, dt_s_fallback)
         max_v, max_a, max_j = self._limits(cfg, overrides or {})
 
@@ -156,6 +161,7 @@ class RuckigCspPlanner:
         overrides: Optional[Dict[str, Optional[float]]] = None,
     ) -> None:
         self._require()
+        self._last_error.pop(slave_pos, None)
         dt = self._dt_s(cfg, dt_s_fallback)
         # Velocity mode uses v/a/j limits; max_velocity isn't required to be set, but we will use it if provided.
         max_v, max_a, max_j = self._limits(cfg, overrides or {})
@@ -232,7 +238,23 @@ class RuckigCspPlanner:
                 inp.target_acceleration = [0.0]
                 inp.target_position = [cur_pos + (tv * lookahead)]
 
-            res = otg.update(inp, out)
+            try:
+                res = otg.update(inp, out)
+            except Exception:
+                if s.get("mode") != "velocity" or s.get("velocity_recovery_attempted"):
+                    raise
+                s["velocity_recovery_attempted"] = True
+                tv = float(s.get("target_velocity") or 0.0)
+                lookahead = min(float(s.get("lookahead_s") or 0.5), 0.5)
+                if lookahead <= 0:
+                    lookahead = 0.1
+                cur_pos = float(inp.current_position[0])
+                inp.current_acceleration = [0.0]
+                inp.target_velocity = [tv]
+                inp.target_acceleration = [0.0]
+                inp.target_position = [cur_pos + (tv * lookahead)]
+                s["lookahead_s"] = lookahead
+                res = otg.update(inp, out)
             done = self._is_finished(res)
 
             if hasattr(out, "pass_to_input"):
@@ -254,6 +276,7 @@ class RuckigCspPlanner:
             return RuckigStep(position=pos, velocity=vel, acceleration=acc, done=done, result=res)
         except Exception as e:
             s["error"] = str(e)
+            self._last_error[slave_pos] = str(e)
             logger.error(f"Ruckig step failed for slave {slave_pos}: {e}")
             # On failure, stop motion generation for safety.
             self._state.pop(slave_pos, None)
