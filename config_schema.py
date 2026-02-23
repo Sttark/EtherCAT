@@ -106,6 +106,7 @@ class EthercatNetworkConfig:
     cycle_time_ms: float = 5.0
     cpu_core: Optional[int] = None
     rt_priority: Optional[int] = None
+    irq_affinity: Dict[int, str] = field(default_factory=dict)
     sdo_only: bool = False
     # --- Startup preflight (optional, safety-first) ---
     # If True, and requesting the master fails, attempt to release any prior process holding the
@@ -138,8 +139,16 @@ class EthercatNetworkConfig:
     force_disable_on_start: bool = False
     forbid_motion_commands: bool = False
     jitter_window_size: int = 2048
+    jitter_warmup_cycles: int = 0
+    deadline_miss_threshold_ns: int = 0
     status_publish_period_s: float = 0.05
     status_proxy_refresh_s: float = 0.02
+    process_log_file: Optional[str] = None
+    process_log_stderr: bool = True
+    process_status_debug_log: bool = True
+    process_timing_log: bool = True
+    process_timing_log_period_s: float = 1.0
+    process_op_transition_log: bool = True
     dc_reference_slave: Optional[int] = None
     slaves: List[DriveConfig] = field(default_factory=list)
 

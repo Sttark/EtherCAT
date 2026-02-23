@@ -23,7 +23,7 @@ from .constants import (
     PROBE_FUNC_ENABLE_PROBE1, PROBE_FUNC_PROBE1_POS_EDGE, PROBE_FUNC_PROBE1_NEG_EDGE,
 )
 from .config_schema import EthercatNetworkConfig, DriveConfig
-from .igh_master import Master
+from .igh_master import Master, MasterException, SDOException
 from .xml_decoder import decode_esi
 from .ruckig_planner import RuckigCspPlanner, RuckigUnavailable
 
@@ -31,6 +31,25 @@ from .ruckig_planner import RuckigCspPlanner, RuckigUnavailable
 logger = logging.getLogger(__name__)
 
 AL_STATE_OP = 0x08
+FAULT_CODE_LABELS: Dict[int, str] = {
+    0x0000: "No error",
+    0x1000: "Generic error",
+    0x2300: "Current sensor",
+    0x3100: "Overvoltage",
+    0x3200: "Undervoltage",
+    0x4200: "Temperature",
+    0x5400: "Driver disabled",
+    0x6010: "Software reset",
+    0x6100: "Internal software",
+    0x6320: "Rated current",
+    0x7300: "Sensor error",
+    0x7500: "Communication",
+    0x8400: "Velocity/speed",
+    0x8600: "Velocity control",
+    0x8611: "Velocity demand overflow",
+    0x8612: "Velocity demand too high",
+    0xFF00: "Manufacturer-specific",
+}
 
 
 def _wrap_i32(v: int) -> int:
@@ -38,6 +57,39 @@ def _wrap_i32(v: int) -> int:
 
 
 class EtherCATProcess:
+    def _apply_irq_affinity(self) -> None:
+        rules = getattr(self.cfg, "irq_affinity", None)
+        if not isinstance(rules, dict) or not rules:
+            return
+        for irq_raw, affinity_raw in rules.items():
+            try:
+                irq = int(irq_raw)
+            except Exception:
+                self._emit_process_log(f"[EC] irq_affinity invalid irq={irq_raw}", stderr=True)
+                continue
+            affinity = str(affinity_raw).strip()
+            if not affinity:
+                self._emit_process_log(f"[EC] irq_affinity empty affinity irq={irq}", stderr=True)
+                continue
+            path = f"/proc/irq/{irq}/smp_affinity_list"
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(affinity)
+                effective = affinity
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        effective = f.read().strip() or affinity
+                except Exception:
+                    pass
+                self._emit_process_log(
+                    f"[EC] irq_affinity irq={irq} target={affinity} effective={effective}"
+                )
+            except Exception as e:
+                self._emit_process_log(
+                    f"[EC] irq_affinity failed irq={irq} target={affinity} error={e}",
+                    stderr=True,
+                )
+
     def _install_signal_handlers(self) -> None:
         """
         Ensure SIGTERM/SIGINT (e.g., systemd stop) results in a graceful shutdown.
@@ -117,15 +169,30 @@ class EtherCATProcess:
         self._cia402_positions: set = set()
         self._raw_pdo_writes: Dict[int, Dict[Tuple[int, int], bytes]] = {}
         self._status_publish_count: int = 0
+        self._jitter_warmup_cycles: int = max(0, int(getattr(self.cfg, "jitter_warmup_cycles", 0)))
+        self._deadline_miss_threshold_ns: int = int(getattr(self.cfg, "deadline_miss_threshold_ns", 0) or 0)
+        if self._deadline_miss_threshold_ns <= 0:
+            self._deadline_miss_threshold_ns = int(float(self.cfg.cycle_time_ms) * 1_000_000.0 * 0.25)
+            if self._deadline_miss_threshold_ns <= 0:
+                self._deadline_miss_threshold_ns = 1
+        self._last_cycle_time_ns: Optional[int] = None
         self._last_cycle_time_us: Optional[int] = None
+        self._last_cycle_jitter_ns: Optional[int] = None
         self._last_cycle_jitter_us: Optional[int] = None
+        self._max_abs_cycle_jitter_ns: int = 0
         self._max_abs_cycle_jitter_us: int = 0
+        self._max_abs_cycle_jitter_post_warmup_ns: int = 0
+        self._max_abs_cycle_jitter_post_warmup_us: int = 0
+        self._jitter_window_ns: deque[int] = deque(maxlen=max(32, int(getattr(self.cfg, "jitter_window_size", 2048))))
         self._jitter_window: deque[int] = deque(maxlen=max(32, int(getattr(self.cfg, "jitter_window_size", 2048))))
         self._deadline_miss_count: int = 0
         self._last_domain_wc: Optional[int] = None
         self._last_domain_wc_state: Optional[int] = None
         self._domain_wc_min: Optional[int] = None
         self._domain_wc_max: Optional[int] = None
+        self._last_dc_sync_error_ns: Optional[int] = None
+        self._max_abs_dc_sync_error_ns: int = 0
+        self._dc_sync_error_window_ns: deque[int] = deque(maxlen=max(32, int(getattr(self.cfg, "jitter_window_size", 2048))))
         self._motion_command_block_count: int = 0
         self._op_entered_first_ns: Dict[int, int] = {}
         self._op_entered_last_ns: Dict[int, int] = {}
@@ -134,6 +201,9 @@ class EtherCATProcess:
         self._all_op_first_ns: Optional[int] = None
         self._all_op_last_ns: Optional[int] = None
         self._all_left_op_last_ns: Optional[int] = None
+        self._fault_active_last: Dict[int, bool] = {}
+        self._fault_error_code_last: Dict[int, Optional[int]] = {}
+        self._op_timeout_active: bool = False
 
         # Ruckig (optional CSP trajectory generation)
         self._ruckig_planner: Optional[RuckigCspPlanner] = None
@@ -170,6 +240,24 @@ class EtherCATProcess:
             "blend_rt": None,
             "comp_raw_rt": None,
         }
+        self._process_log_file: Optional[str] = str(getattr(self.cfg, "process_log_file", "")).strip() or None
+
+    def _emit_process_log(self, message: str, stderr: Optional[bool] = None) -> None:
+        if stderr is None:
+            stderr = bool(getattr(self.cfg, "process_log_stderr", True))
+        line = message if message.endswith("\n") else (message + "\n")
+        if self._process_log_file:
+            try:
+                with open(self._process_log_file, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except Exception:
+                pass
+        if stderr:
+            try:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+            except Exception:
+                pass
 
     @staticmethod
     def _percentile_value(values: List[int], percentile: float) -> Optional[int]:
@@ -185,6 +273,33 @@ class EtherCATProcess:
         if idx >= len(values):
             idx = len(values) - 1
         return values[idx]
+
+    @staticmethod
+    def _fault_code_label(error_code: Optional[int]) -> str:
+        if error_code is None:
+            return "Unknown"
+        return FAULT_CODE_LABELS.get(int(error_code), "Unknown")
+
+    def _read_fault_error_code(self, slave_pos: int, entries: Dict[Tuple[int, int], int]) -> Tuple[Optional[int], str]:
+        error_code: Optional[int] = None
+        if (ERROR_CODE_INDEX, 0) in entries:
+            raw_ec = self.master.read_domain(self.domain, entries[(ERROR_CODE_INDEX, 0)], 2)
+            if raw_ec:
+                error_code = int.from_bytes(raw_ec, "little")
+                if error_code not in (None, 0):
+                    return error_code, "pdo"
+        if bool(getattr(self.cfg, "fault_error_code_sdo_fallback", False)):
+            try:
+                raw_sdo = self.master.sdo_upload(slave_pos, ERROR_CODE_INDEX, 0, max_size=2)
+                if raw_sdo and len(raw_sdo) >= 2:
+                    return int.from_bytes(raw_sdo[:2], "little"), "sdo"
+            except (SDOException, MasterException):
+                pass
+            except Exception:
+                pass
+        if error_code is not None:
+            return error_code, "pdo"
+        return None, "unavailable"
 
     def _setup(self) -> bool:
         # Open/request the master with or without PDO based on config
@@ -721,6 +836,20 @@ class EtherCATProcess:
             # Decode CiA 402 state from statusword
             # Check for FAULT first (bit 3 set)
             if statusword & 0x0008:
+                error_code, error_code_source = self._read_fault_error_code(slave_pos, entries)
+                was_fault = bool(self._fault_active_last.get(slave_pos, False))
+                prev_code = self._fault_error_code_last.get(slave_pos)
+                if (not was_fault) or (prev_code != error_code):
+                    if error_code is None:
+                        self._emit_process_log(
+                            f"Slave {slave_pos}: FAULT (statusword=0x{statusword:04X}) reason=error_code_unavailable source={error_code_source}"
+                        )
+                    else:
+                        self._emit_process_log(
+                            f"Slave {slave_pos}: FAULT (statusword=0x{statusword:04X}, error_code=0x{error_code:04X}, reason={self._fault_code_label(error_code)}, source={error_code_source})"
+                        )
+                self._fault_active_last[slave_pos] = True
+                self._fault_error_code_last[slave_pos] = error_code
                 # FAULT state - send fault reset
                 step = self.enable_step.get(slave_pos, 0)
                 if step < 10:  # Limit fault reset attempts
@@ -728,9 +857,11 @@ class EtherCATProcess:
                     self.desired_controlword[slave_pos] = 0x0080
                     self.enable_step[slave_pos] = step + 1
                     self.enable_last_action_ns[slave_pos] = now_ns
-                    if step == 0:  # Log once
-                        logger.info(f"Slave {slave_pos}: FAULT (0x{statusword:04X}) → sending FAULT_RESET")
+                    if step == 0:
+                        logger.info(f"Slave {slave_pos}: sending FAULT_RESET")
                 continue  # Move to next slave
+            else:
+                self._fault_active_last[slave_pos] = False
             
             # Determine current state using CiA 402 standard bit patterns
             state_bits = statusword & 0x006F
@@ -775,9 +906,18 @@ class EtherCATProcess:
         status = NetworkStatus(drives={})
         status.timestamp_ns = int(time.time() * 1_000_000_000)
         status.cycle_time_ms_config = self.cfg.cycle_time_ms
+        status.last_cycle_time_ns = self._last_cycle_time_ns
         status.last_cycle_time_us = self._last_cycle_time_us
+        status.last_cycle_jitter_ns = self._last_cycle_jitter_ns
         status.last_cycle_jitter_us = self._last_cycle_jitter_us
+        status.max_abs_cycle_jitter_ns = self._max_abs_cycle_jitter_ns
         status.max_abs_cycle_jitter_us = self._max_abs_cycle_jitter_us
+        status.max_abs_cycle_jitter_post_warmup_ns = self._max_abs_cycle_jitter_post_warmup_ns
+        status.max_abs_cycle_jitter_post_warmup_us = self._max_abs_cycle_jitter_post_warmup_us
+        jitter_sorted_ns = sorted(self._jitter_window_ns)
+        status.jitter_p95_ns = self._percentile_value(jitter_sorted_ns, 95.0)
+        status.jitter_p99_ns = self._percentile_value(jitter_sorted_ns, 99.0)
+        status.jitter_p999_ns = self._percentile_value(jitter_sorted_ns, 99.9)
         jitter_sorted = sorted(self._jitter_window)
         status.jitter_p95_us = self._percentile_value(jitter_sorted, 95.0)
         status.jitter_p99_us = self._percentile_value(jitter_sorted, 99.0)
@@ -787,6 +927,13 @@ class EtherCATProcess:
         status.domain_wc_state = self._last_domain_wc_state
         status.domain_wc_min = self._domain_wc_min
         status.domain_wc_max = self._domain_wc_max
+        status.dc_sync_error_ns = self._last_dc_sync_error_ns
+        dc_sorted = sorted(self._dc_sync_error_window_ns)
+        status.dc_sync_error_p95_ns = self._percentile_value(dc_sorted, 95.0)
+        status.dc_sync_error_p99_ns = self._percentile_value(dc_sorted, 99.0)
+        status.dc_sync_error_p999_ns = self._percentile_value(dc_sorted, 99.9)
+        status.dc_sync_error_max_ns = self._max_abs_dc_sync_error_ns
+        status.dc_sync_samples = len(dc_sorted)
         status.motion_command_block_count = self._motion_command_block_count
         status.all_slaves_op_first_ns = self._all_op_first_ns
         status.all_slaves_op_last_ns = self._all_op_last_ns
@@ -905,14 +1052,15 @@ class EtherCATProcess:
             status.drives[slave_pos] = drive
         try:
             self.status_q.put_nowait(status)
-            if self._status_publish_count < 3:
+            if bool(getattr(self.cfg, "process_status_debug_log", True)) and self._status_publish_count < 3:
                 self._status_publish_count += 1
-                sys.stderr.write(f"[EC] status published cycle={self.cycle_count} drives={list(status.drives.keys())} qsize={self.status_q.qsize()}\n")
-                sys.stderr.flush()
+                self._emit_process_log(
+                    f"[EC] status published cycle={self.cycle_count} drives={list(status.drives.keys())} qsize={self.status_q.qsize()}"
+                )
         except queue.Full:
             pass
         except Exception as e:
-            sys.stderr.write(f"[EC] status_q.put FAILED: {e}\n")
+            self._emit_process_log(f"[EC] status_q.put FAILED: {e}", stderr=True)
             traceback.print_exc(file=sys.stderr)
             sys.stderr.flush()
 
@@ -1400,13 +1548,14 @@ class EtherCATProcess:
         except SystemExit:
             raise
         except Exception:
-            sys.stderr.write("ETHERCAT PROCESS FATAL:\n")
+            self._emit_process_log("ETHERCAT PROCESS FATAL:", stderr=True)
             traceback.print_exc(file=sys.stderr)
             sys.stderr.flush()
             raise
 
     def _run_inner(self):
         self._install_signal_handlers()
+        self._apply_irq_affinity()
 
         if self.cfg.rt_priority is not None:
             SCHED_FIFO = 1
@@ -1437,23 +1586,38 @@ class EtherCATProcess:
                 cycle_start_mono = time.monotonic_ns()
                 actual_cycle_ns = cycle_start_mono - prev_cycle_start_mono
                 prev_cycle_start_mono = cycle_start_mono
+                self._last_cycle_time_ns = int(actual_cycle_ns)
                 self._last_cycle_time_us = int(actual_cycle_ns / 1000)
                 cycle_jitter_ns = actual_cycle_ns - cycle_ns
+                self._last_cycle_jitter_ns = int(cycle_jitter_ns)
                 self._last_cycle_jitter_us = int(cycle_jitter_ns / 1000)
+                self._jitter_window_ns.append(self._last_cycle_jitter_ns)
                 self._jitter_window.append(self._last_cycle_jitter_us)
+                max_abs_cycle_jitter_ns = int(abs(cycle_jitter_ns))
+                if max_abs_cycle_jitter_ns > self._max_abs_cycle_jitter_ns:
+                    self._max_abs_cycle_jitter_ns = max_abs_cycle_jitter_ns
                 max_abs_cycle_jitter_us = int(abs(cycle_jitter_ns) / 1000)
                 if max_abs_cycle_jitter_us > self._max_abs_cycle_jitter_us:
                     self._max_abs_cycle_jitter_us = max_abs_cycle_jitter_us
-                if cycle_start_mono > next_cycle_mono:
+                if self.cycle_count >= self._jitter_warmup_cycles:
+                    if max_abs_cycle_jitter_ns > self._max_abs_cycle_jitter_post_warmup_ns:
+                        self._max_abs_cycle_jitter_post_warmup_ns = max_abs_cycle_jitter_ns
+                    if max_abs_cycle_jitter_us > self._max_abs_cycle_jitter_post_warmup_us:
+                        self._max_abs_cycle_jitter_post_warmup_us = max_abs_cycle_jitter_us
+                lateness_ns = cycle_start_mono - next_cycle_mono
+                if lateness_ns > self._deadline_miss_threshold_ns:
                     self._deadline_miss_count += 1
-                if cycle_start_mono - last_timing_log_mono >= 1_000_000_000:
-                    sys.stderr.write(
-                        f"[EC] loop timing: target_us={int(cycle_ns / 1000)} "
-                        f"actual_us={self._last_cycle_time_us} "
-                        f"jitter_us={self._last_cycle_jitter_us} "
-                        f"max_abs_jitter_us={self._max_abs_cycle_jitter_us}\n"
+                timing_log_period_ns = int(float(getattr(self.cfg, "process_timing_log_period_s", 1.0)) * 1_000_000_000)
+                if timing_log_period_ns <= 0:
+                    timing_log_period_ns = 1_000_000_000
+                if bool(getattr(self.cfg, "process_timing_log", True)) and cycle_start_mono - last_timing_log_mono >= timing_log_period_ns:
+                    self._emit_process_log(
+                        f"[EC] loop timing: target_ns={int(cycle_ns)} "
+                        f"actual_ns={self._last_cycle_time_ns} "
+                        f"jitter_ns={self._last_cycle_jitter_ns} "
+                        f"max_abs_jitter_post_warmup_ns={self._max_abs_cycle_jitter_post_warmup_ns} "
+                        f"lateness_ns={lateness_ns}"
                     )
-                    sys.stderr.flush()
                     last_timing_log_mono = cycle_start_mono
                 self.cycle_count += 1
                 next_cycle_mono += cycle_ns
@@ -1486,7 +1650,8 @@ class EtherCATProcess:
                         was_op = self.slave_in_op[pos]
                         if is_op and not was_op:
                             self.slave_in_op[pos] = True
-                            logger.info(f"Slave {pos} entered OP (al_state=0x{sc_state.get('al_state', 0):02X})")
+                            if bool(getattr(self.cfg, "process_op_transition_log", True)):
+                                self._emit_process_log(f"Slave {pos} entered OP (al_state=0x{sc_state.get('al_state', 0):02X})")
                             if pos not in self._op_entered_first_ns:
                                 self._op_entered_first_ns[pos] = cycle_start_mono
                             self._op_entered_last_ns[pos] = cycle_start_mono
@@ -1498,7 +1663,8 @@ class EtherCATProcess:
                             self._pp_pulse_start_ns[pos] = None
                             self._pp_pulse_pending[pos] = False
                             al = sc_state.get('al_state', 0) if sc_state else 0
-                            logger.warning(f"Slave {pos} left OP (al_state=0x{al:02X}, domain WC={wc})")
+                            if bool(getattr(self.cfg, "process_op_transition_log", True)):
+                                self._emit_process_log(f"Slave {pos} left OP (al_state=0x{al:02X}, domain WC={wc})")
                             self._op_left_last_ns[pos] = cycle_start_mono
                             self._op_dropout_count[pos] = int(self._op_dropout_count.get(pos, 0)) + 1
 
@@ -1515,7 +1681,16 @@ class EtherCATProcess:
                         if elapsed_s >= float(self.cfg.op_timeout_s):
                             not_op = [p for p in self.slave_in_op.keys() if not self.slave_in_op.get(p, False)]
                             if not_op:
-                                raise RuntimeError(f"OP timeout after {self.cfg.op_timeout_s}s. Not in OP: {not_op}. Domain WC={wc}, state={wc_state}")
+                                if not self._op_timeout_active:
+                                    self._emit_process_log(
+                                        f"[EC] OP timeout after {self.cfg.op_timeout_s}s. Not in OP: {not_op}. Domain WC={wc}, state={wc_state}",
+                                        stderr=True,
+                                    )
+                                    self._op_timeout_active = True
+                            else:
+                                if self._op_timeout_active:
+                                    self._emit_process_log("[EC] OP timeout condition cleared; all slaves back in OP")
+                                self._op_timeout_active = False
 
                     if getattr(self.cfg, "auto_enable_cia402", True):
                         self._auto_enable_drives()
@@ -1529,6 +1704,18 @@ class EtherCATProcess:
                         pass
                     self.master.sync_reference_clock()
                     self.master.sync_slave_clocks()
+                    try:
+                        dc_err_ns = self.master.sync_monitor_process()
+                        if dc_err_ns is not None:
+                            dc_err_ns = int(dc_err_ns)
+                            self._last_dc_sync_error_ns = dc_err_ns
+                            self._dc_sync_error_window_ns.append(dc_err_ns)
+                            abs_dc = abs(dc_err_ns)
+                            if abs_dc > self._max_abs_dc_sync_error_ns:
+                                self._max_abs_dc_sync_error_ns = abs_dc
+                        self.master.sync_monitor_queue()
+                    except Exception:
+                        pass
 
                     self.master.queue_domain(self.domain)
                     self.master.send()

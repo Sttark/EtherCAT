@@ -287,6 +287,13 @@ if _libec:
     _libec.ecrt_master_sync_slave_clocks.argtypes = [ctypes.POINTER(ec_master_t)]
     _libec.ecrt_master_sync_slave_clocks.restype = ctypes.c_int
 
+    if hasattr(_libec, "ecrt_master_sync_monitor_queue"):
+        _libec.ecrt_master_sync_monitor_queue.argtypes = [ctypes.POINTER(ec_master_t)]
+        _libec.ecrt_master_sync_monitor_queue.restype = None
+    if hasattr(_libec, "ecrt_master_sync_monitor_process"):
+        _libec.ecrt_master_sync_monitor_process.argtypes = [ctypes.POINTER(ec_master_t)]
+        _libec.ecrt_master_sync_monitor_process.restype = ctypes.c_uint32
+
 
 class SlaveConfig:
     def __init__(self, position: int, vendor_id: int, product_code: int):
@@ -671,6 +678,18 @@ class Master:
     def sync_slave_clocks(self):
         if self._master_handle and self._activated:
             _libec.ecrt_master_sync_slave_clocks(self._master_handle)
+
+    def sync_monitor_queue(self):
+        if self._master_handle and self._activated and hasattr(_libec, "ecrt_master_sync_monitor_queue"):
+            _libec.ecrt_master_sync_monitor_queue(self._master_handle)
+
+    def sync_monitor_process(self) -> Optional[int]:
+        if self._master_handle and self._activated and hasattr(_libec, "ecrt_master_sync_monitor_process"):
+            v = int(_libec.ecrt_master_sync_monitor_process(self._master_handle))
+            if v == 0xFFFFFFFF:
+                return None
+            return v
+        return None
 
     def get_slave_count(self) -> int:
         if not self._master_handle:

@@ -23,9 +23,17 @@ class DriveStatus:
 class NetworkStatus:
     timestamp_ns: Optional[int] = None
     cycle_time_ms_config: Optional[float] = None
+    last_cycle_time_ns: Optional[int] = None
     last_cycle_time_us: Optional[int] = None
+    last_cycle_jitter_ns: Optional[int] = None
     last_cycle_jitter_us: Optional[int] = None
+    max_abs_cycle_jitter_ns: Optional[int] = None
     max_abs_cycle_jitter_us: Optional[int] = None
+    max_abs_cycle_jitter_post_warmup_ns: Optional[int] = None
+    max_abs_cycle_jitter_post_warmup_us: Optional[int] = None
+    jitter_p95_ns: Optional[int] = None
+    jitter_p99_ns: Optional[int] = None
+    jitter_p999_ns: Optional[int] = None
     jitter_p95_us: Optional[int] = None
     jitter_p99_us: Optional[int] = None
     jitter_p999_us: Optional[int] = None
@@ -34,6 +42,12 @@ class NetworkStatus:
     domain_wc_state: Optional[int] = None
     domain_wc_min: Optional[int] = None
     domain_wc_max: Optional[int] = None
+    dc_sync_error_ns: Optional[int] = None
+    dc_sync_error_p95_ns: Optional[int] = None
+    dc_sync_error_p99_ns: Optional[int] = None
+    dc_sync_error_p999_ns: Optional[int] = None
+    dc_sync_error_max_ns: Optional[int] = None
+    dc_sync_samples: int = 0
     motion_command_block_count: int = 0
     all_slaves_op_first_ns: Optional[int] = None
     all_slaves_op_last_ns: Optional[int] = None
