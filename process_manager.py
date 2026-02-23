@@ -240,7 +240,12 @@ class EtherCATProcess:
             "blend_rt": None,
             "comp_raw_rt": None,
         }
-        self._process_log_file: Optional[str] = str(getattr(self.cfg, "process_log_file", "")).strip() or None
+        raw_process_log_file = getattr(self.cfg, "process_log_file", None)
+        if raw_process_log_file is None:
+            self._process_log_file = None
+        else:
+            candidate = str(raw_process_log_file).strip()
+            self._process_log_file = None if (not candidate or candidate.lower() == "none") else candidate
 
     def _emit_process_log(self, message: str, stderr: Optional[bool] = None) -> None:
         if stderr is None:
