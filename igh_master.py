@@ -14,7 +14,8 @@ import logging
 import shutil
 import subprocess
 import time
-from typing import Optional, Tuple, Dict
+import threading
+from typing import Optional, Tuple, Dict, Callable
 
 
 logger = logging.getLogger(__name__)
@@ -771,6 +772,104 @@ class Master:
                 f"abort_code=0x{abort_code.value:08X}"
             )
         return bytes(buffer[:result_size.value])
+
+    def sdo_upload_async(self, slave_position: int, index: int, subindex: int,
+                         max_size: int = 4, timeout_s: float = 2.0,
+                         callback: Optional[Callable[[Optional[bytes], Optional[Exception]], None]] = None):
+        """
+        Non-blocking SDO upload that spawns a thread to perform the operation.
+        
+        Args:
+            slave_position: EtherCAT slave position
+            index: SDO index
+            subindex: SDO subindex
+            max_size: Maximum bytes to read
+            timeout_s: Timeout in seconds for the SDO operation
+            callback: Optional callback(result, error) invoked when complete or timeout
+        
+        The callback receives:
+            - result: bytes if successful, None if failed/timeout
+            - error: Exception if failed, None if successful
+        """
+        def worker():
+            result = None
+            error = None
+            result_event = threading.Event()
+            
+            def inner():
+                nonlocal result, error
+                try:
+                    result = self.sdo_upload(slave_position, index, subindex, max_size)
+                except Exception as e:
+                    error = e
+                finally:
+                    result_event.set()
+            
+            thread = threading.Thread(target=inner, daemon=True)
+            thread.start()
+            thread.join(timeout=timeout_s)
+            
+            if not result_event.is_set():
+                error = TimeoutError(f"SDO upload timeout after {timeout_s}s: slave={slave_position}, index=0x{index:04X}, subindex={subindex}")
+                logger.warning(str(error))
+            
+            if callback:
+                try:
+                    callback(result, error)
+                except Exception as cb_error:
+                    logger.error(f"SDO upload callback error: {cb_error}")
+        
+        spawn_thread = threading.Thread(target=worker, daemon=True)
+        spawn_thread.start()
+
+    def sdo_download_async(self, slave_position: int, index: int, subindex: int,
+                           data: bytes, timeout_s: float = 2.0,
+                           callback: Optional[Callable[[bool, Optional[Exception]], None]] = None):
+        """
+        Non-blocking SDO download that spawns a thread to perform the operation.
+        
+        Args:
+            slave_position: EtherCAT slave position
+            index: SDO index
+            subindex: SDO subindex
+            data: Bytes to write
+            timeout_s: Timeout in seconds for the SDO operation
+            callback: Optional callback(success, error) invoked when complete or timeout
+        
+        The callback receives:
+            - success: True if successful, False if failed/timeout
+            - error: Exception if failed, None if successful
+        """
+        def worker():
+            success = False
+            error = None
+            result_event = threading.Event()
+            
+            def inner():
+                nonlocal success, error
+                try:
+                    success = self.sdo_download(slave_position, index, subindex, data)
+                except Exception as e:
+                    error = e
+                finally:
+                    result_event.set()
+            
+            thread = threading.Thread(target=inner, daemon=True)
+            thread.start()
+            thread.join(timeout=timeout_s)
+            
+            if not result_event.is_set():
+                error = TimeoutError(f"SDO download timeout after {timeout_s}s: slave={slave_position}, index=0x{index:04X}, subindex={subindex}")
+                logger.warning(str(error))
+            
+            if callback:
+                try:
+                    callback(success, error)
+                except Exception as cb_error:
+                    logger.error(f"SDO download callback error: {cb_error}")
+        
+        spawn_thread = threading.Thread(target=worker, daemon=True)
+        spawn_thread.start()
 
     def send(self):
         if self._master_handle and self._activated:

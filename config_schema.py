@@ -128,9 +128,9 @@ class EthercatNetworkConfig:
     # Timeout to reach OP after activation. If any slave stays out of OP longer than this,
     # the process will error/stop (prevents infinite SAFEOP stalls).
     op_timeout_s: float = 10.0
-    # CiA402 enable state machine pacing (time-based). Default 100ms is conservative and
+    # CiA402 enable state machine pacing (time-based). Default 500ms is conservative and
     # matches the proven behavior in the legacy runtime. Can be tightened for faster drives.
-    enable_transition_period_ms: float = 100.0
+    enable_transition_period_ms: float = 500.0
     # Profile Position (PP) "new set-point" pulse handshake parameters.
     # Bit 12 (0x1000) is commonly "set-point acknowledged" in CiA402 PP.
     pp_ack_mask: int = 0x1000
@@ -150,6 +150,9 @@ class EthercatNetworkConfig:
     process_timing_log_period_s: float = 1.0
     process_op_transition_log: bool = True
     dc_reference_slave: Optional[int] = None
+    # SDO operation timeout and control
+    sdo_timeout_s: float = 2.0
+    fault_error_code_sdo_fallback: bool = True
     slaves: List[DriveConfig] = field(default_factory=list)
 
 

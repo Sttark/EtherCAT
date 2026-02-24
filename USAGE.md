@@ -23,7 +23,7 @@ cfg = EthercatNetworkConfig(
     ethercat_device_path="/dev/EtherCAT0",
     # Safety/correctness knobs (optional)
     op_timeout_s=10.0,                 # Fail fast if slaves never reach OP (prevents SAFEOP stalls)
-    enable_transition_period_ms=100.0, # Time-based CiA402 enable pacing (default 100ms)
+    enable_transition_period_ms=500.0, # Time-based CiA402 enable pacing (default 500ms)
     pp_ack_mask=0x1000,                # PP set-point acknowledged bit (CiA402 typical)
     pp_ack_timeout_ms=100.0,           # Clear PP bit4 if no ack within this time
     slaves=[

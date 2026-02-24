@@ -142,6 +142,11 @@ class EtherCATProcess:
         self._last_velocity_sdo: Dict[int, Optional[int]] = {}
         self._last_torque_sdo: Dict[int, Optional[int]] = {}
         self.last_probe_arm: Dict[int, Optional[int]] = {}
+        
+        # SDO result cache: {(slave_pos, index, subindex): (result_bytes, timestamp)}
+        self._sdo_cache: Dict[Tuple[int, int, int], Tuple[Optional[bytes], float]] = {}
+        # SDO request tracking: {(slave_pos, index, subindex): timestamp} to avoid duplicate requests
+        self._sdo_pending: Dict[Tuple[int, int, int], float] = {}
         self.pdo_maps: Dict[int, Dict[str, Dict[int, list]]] = {}
         # CiA 402 state machine tracking
         self.enable_step: Dict[int, int] = {}  # Fault reset attempt counter
@@ -408,21 +413,52 @@ class EtherCATProcess:
 
     def _read_fault_error_code(self, slave_pos: int, entries: Dict[Tuple[int, int], int]) -> Tuple[Optional[int], str]:
         error_code: Optional[int] = None
+        
+        # Try PDO first
         if (ERROR_CODE_INDEX, 0) in entries:
             raw_ec = self.master.read_domain(self.domain, entries[(ERROR_CODE_INDEX, 0)], 2)
             if raw_ec:
                 error_code = int.from_bytes(raw_ec, "little")
                 if error_code not in (None, 0):
                     return error_code, "pdo"
-        if bool(getattr(self.cfg, "fault_error_code_sdo_fallback", False)):
-            try:
-                raw_sdo = self.master.sdo_upload(slave_pos, ERROR_CODE_INDEX, 0, max_size=2)
-                if raw_sdo and len(raw_sdo) >= 2:
-                    return int.from_bytes(raw_sdo[:2], "little"), "sdo"
-            except (SDOException, MasterException):
-                pass
-            except Exception:
-                pass
+        
+        # Try cached SDO result
+        sdo_key = (slave_pos, ERROR_CODE_INDEX, 0)
+        if sdo_key in self._sdo_cache:
+            cached_result, _ = self._sdo_cache[sdo_key]
+            if cached_result and len(cached_result) >= 2:
+                ec = int.from_bytes(cached_result[:2], "little")
+                if ec != 0:
+                    return ec, "sdo_cached"
+        
+        # Spawn async SDO request if not already pending
+        if bool(getattr(self.cfg, "fault_error_code_sdo_fallback", True)):
+            now = time.time()
+            # Only spawn if not pending or last request was >5s ago (avoid spam)
+            if sdo_key not in self._sdo_pending or (now - self._sdo_pending[sdo_key]) > 5.0:
+                self._sdo_pending[sdo_key] = now
+                
+                def error_code_callback(result, error):
+                    # Store result in cache
+                    self._sdo_cache[sdo_key] = (result, time.time())
+                    # Remove from pending
+                    self._sdo_pending.pop(sdo_key, None)
+                    
+                    if error is None and result and len(result) >= 2:
+                        ec = int.from_bytes(result[:2], "little")
+                        if ec != 0:
+                            ec_label = self._fault_code_label(ec)
+                            logger.info(f"[SDO async] Slave {slave_pos}: Error code 0x{ec:04X} ({ec_label})")
+                    elif error is not None:
+                        logger.warning(f"[SDO async] Slave {slave_pos}: Error code read failed: {error}")
+                
+                timeout_s = float(getattr(self.cfg, "sdo_timeout_s", 2.0))
+                self.master.sdo_upload_async(
+                    slave_pos, ERROR_CODE_INDEX, 0,
+                    max_size=2, timeout_s=timeout_s,
+                    callback=error_code_callback
+                )
+        
         if error_code is not None:
             return error_code, "pdo"
         return None, "unavailable"
@@ -1298,12 +1334,19 @@ class EtherCATProcess:
                     else:
                         prev_sdo_vel = self._last_velocity_sdo.get(slave_pos)
                         if v != prev_sdo_vel:
-                            logger.info(f"Slave {slave_pos}: {hex(TARGET_VELOCITY_INDEX)} not in PDO; writing vel={v} via SDO")
-                            try:
-                                self.master.sdo_download(slave_pos, TARGET_VELOCITY_INDEX, 0, v.to_bytes(4, 'little', signed=True))
-                                self._last_velocity_sdo[slave_pos] = v
-                            except Exception as e:
-                                logger.error(f"SDO write {hex(TARGET_VELOCITY_INDEX)} failed: {e}")
+                            logger.info(f"Slave {slave_pos}: {hex(TARGET_VELOCITY_INDEX)} not in PDO; writing vel={v} via async SDO")
+                            self._last_velocity_sdo[slave_pos] = v
+                            
+                            def vel_callback(success, error):
+                                if error is not None:
+                                    logger.error(f"[SDO async] Velocity write failed for slave {slave_pos}: {error}")
+                            
+                            timeout_s = float(getattr(self.cfg, "sdo_timeout_s", 2.0))
+                            self.master.sdo_download_async(
+                                slave_pos, TARGET_VELOCITY_INDEX, 0,
+                                v.to_bytes(4, 'little', signed=True),
+                                timeout_s=timeout_s, callback=vel_callback
+                            )
                     if mode_eff != MODE_PT and self._pv_pulse_pending.get(slave_pos, False) and self._pv_pulse_active.get(slave_pos, False):
                         self._pv_pulse_pending[slave_pos] = False
 
@@ -1315,12 +1358,19 @@ class EtherCATProcess:
                 else:
                     prev_sdo_torque = self._last_torque_sdo.get(slave_pos)
                     if t != prev_sdo_torque:
-                        logger.info(f"Slave {slave_pos}: {hex(TARGET_TORQUE_INDEX)} not in PDO; writing torque={t} via SDO")
-                        try:
-                            self.master.sdo_download(slave_pos, TARGET_TORQUE_INDEX, 0, t.to_bytes(2, 'little', signed=True))
-                            self._last_torque_sdo[slave_pos] = t
-                        except Exception as e:
-                            logger.error(f"SDO write {hex(TARGET_TORQUE_INDEX)} failed: {e}")
+                        logger.info(f"Slave {slave_pos}: {hex(TARGET_TORQUE_INDEX)} not in PDO; writing torque={t} via async SDO")
+                        self._last_torque_sdo[slave_pos] = t
+                        
+                        def torque_callback(success, error):
+                            if error is not None:
+                                logger.error(f"[SDO async] Torque write failed for slave {slave_pos}: {error}")
+                        
+                        timeout_s = float(getattr(self.cfg, "sdo_timeout_s", 2.0))
+                        self.master.sdo_download_async(
+                            slave_pos, TARGET_TORQUE_INDEX, 0,
+                            t.to_bytes(2, 'little', signed=True),
+                            timeout_s=timeout_s, callback=torque_callback
+                        )
 
             # Maintain target position (0x607A)
             # - PP/HM: write the last commanded target (latch with bit4 pulse below)
@@ -1348,12 +1398,19 @@ class EtherCATProcess:
                     sdo_done = self.warned_missing_pdo.setdefault(slave_pos, set())
                     key = (TARGET_POSITION_INDEX, 0)
                     if key not in sdo_done:
-                        logger.warning(f"Slave {slave_pos}: {hex(TARGET_POSITION_INDEX)} not in PDO; writing via SDO (once)")
-                        try:
-                            self.master.sdo_download(slave_pos, TARGET_POSITION_INDEX, 0, p.to_bytes(4, 'little', signed=True))
-                        except Exception as e:
-                            logger.error(f"SDO write {hex(TARGET_POSITION_INDEX)} failed: {e}")
+                        logger.warning(f"Slave {slave_pos}: {hex(TARGET_POSITION_INDEX)} not in PDO; writing via async SDO (once)")
                         sdo_done.add(key)
+                        
+                        def pos_callback(success, error):
+                            if error is not None:
+                                logger.error(f"[SDO async] Position write failed for slave {slave_pos}: {error}")
+                        
+                        timeout_s = float(getattr(self.cfg, "sdo_timeout_s", 2.0))
+                        self.master.sdo_download_async(
+                            slave_pos, TARGET_POSITION_INDEX, 0,
+                            p.to_bytes(4, 'little', signed=True),
+                            timeout_s=timeout_s, callback=pos_callback
+                        )
 
             # Controlword bit maintenance (0x6040):
             # Build controlword from desired state machine value + motion bits
@@ -1461,12 +1518,19 @@ class EtherCATProcess:
                     warned = self.warned_missing_pdo.setdefault(slave_pos, set())
                     key = (PROBE_FUNCTION_INDEX, 0)
                     if key not in warned:
-                        logger.warning(f"Slave {slave_pos}: {hex(PROBE_FUNCTION_INDEX)} not in PDO; writing via SDO")
+                        logger.warning(f"Slave {slave_pos}: {hex(PROBE_FUNCTION_INDEX)} not in PDO; writing via async SDO")
                         warned.add(key)
-                    try:
-                        self.master.sdo_download(slave_pos, PROBE_FUNCTION_INDEX, 0, probe_val.to_bytes(2, 'little'))
-                    except Exception as e:
-                        logger.error(f"SDO write {hex(PROBE_FUNCTION_INDEX)} failed: {e}")
+                    
+                    def probe_callback(success, error):
+                        if error is not None:
+                            logger.error(f"[SDO async] Probe write failed for slave {slave_pos}: {error}")
+                    
+                    timeout_s = float(getattr(self.cfg, "sdo_timeout_s", 2.0))
+                    self.master.sdo_download_async(
+                        slave_pos, PROBE_FUNCTION_INDEX, 0,
+                        probe_val.to_bytes(2, 'little'),
+                        timeout_s=timeout_s, callback=probe_callback
+                    )
                     self.last_probe_arm[slave_pos] = None
 
     def _update_semi_rotary_rt(self) -> None:
@@ -1989,18 +2053,21 @@ class EtherCATProcess:
                         pass
                     self.master.sync_reference_clock()
                     self.master.sync_slave_clocks()
-                    try:
-                        dc_err_ns = self.master.sync_monitor_process()
-                        if dc_err_ns is not None:
-                            dc_err_ns = int(dc_err_ns)
-                            self._last_dc_sync_error_ns = dc_err_ns
-                            self._window_append(self._dc_sync_error_window_ns, self._dc_sync_sorted_ns, dc_err_ns)
-                            abs_dc = abs(dc_err_ns)
-                            if abs_dc > self._max_abs_dc_sync_error_ns:
-                                self._max_abs_dc_sync_error_ns = abs_dc
-                        self.master.sync_monitor_queue()
-                    except Exception:
-                        pass
+                    # DC sync monitor decimation: call every 10 cycles instead of every cycle
+                    # This saves 1 mutex acquisition per skipped cycle with no accuracy loss
+                    if self.cycle_count % 10 == 0:
+                        try:
+                            dc_err_ns = self.master.sync_monitor_process()
+                            if dc_err_ns is not None:
+                                dc_err_ns = int(dc_err_ns)
+                                self._last_dc_sync_error_ns = dc_err_ns
+                                self._window_append(self._dc_sync_error_window_ns, self._dc_sync_sorted_ns, dc_err_ns)
+                                abs_dc = abs(dc_err_ns)
+                                if abs_dc > self._max_abs_dc_sync_error_ns:
+                                    self._max_abs_dc_sync_error_ns = abs_dc
+                            self.master.sync_monitor_queue()
+                        except Exception:
+                            pass
 
                     self.master.queue_domain(self.domain)
                     self.master.send()
