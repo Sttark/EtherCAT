@@ -1,0 +1,59 @@
+"""
+Shared memory layout for cyclic process <-> external process communication.
+
+Two flat arrays of int64 (multiprocessing.Array('l', N, lock=False)):
+  - actuals_shm: cyclic process writes after process_domain(), others read
+  - targets_shm: semi-rotary cam process writes, cyclic process reads
+"""
+
+# --- actuals_shm: header slots (global metrics) ---
+SLOT_SEQUENCE = 0
+SLOT_CYCLE_COUNT = 1
+SLOT_TIMESTAMP_NS = 2
+SLOT_JITTER_NS = 3
+SLOT_MAX_JITTER_PW_NS = 4
+SLOT_LATENESS_NS = 5
+SLOT_WORK_NS = 6
+SLOT_MAX_WORK_NS = 7
+SLOT_OVERRUN_COUNT = 8
+SLOT_MAX_OVERRUN_NS = 9
+SLOT_SEND_INTERVAL_NS = 10
+SLOT_MIN_SLEEP_BUDGET_NS = 11
+SLOT_DEADLINE_MISS_COUNT = 12
+SLOT_DC_SYNC_ERR_NS = 13
+SLOT_DC_SYNC_ERR_MAX_NS = 14
+SLOT_DOMAIN_WC = 15
+SLOT_DOMAIN_WC_STATE = 16
+SLOT_DOMAIN_WC_MIN = 17
+SLOT_DOMAIN_WC_MAX = 18
+SLOT_ALL_OP_FIRST_NS = 19
+SLOT_ALL_OP_LAST_NS = 20
+SLOT_ALL_OP_LEFT_LAST_NS = 21
+SLOT_CYCLE_TIME_MS_X1000 = 22
+
+HEADER_SIZE = 24
+
+# --- actuals_shm: per-drive slots ---
+DRIVE_BASE = HEADER_SIZE
+DRIVE_STRIDE = 8
+DRIVE_POSITION = 0
+DRIVE_VELOCITY = 1
+DRIVE_TORQUE = 2
+DRIVE_STATUSWORD = 3
+DRIVE_MODE = 4
+DRIVE_ERROR_CODE = 5
+DRIVE_IN_OP = 6
+DRIVE_ENABLED = 7
+
+MAX_DRIVES = 16
+ACTUALS_SIZE = DRIVE_BASE + MAX_DRIVES * DRIVE_STRIDE
+
+# --- targets_shm: semi-rotary cam targets ---
+TARGET_SEQUENCE = 0
+TARGET_BASE = 1
+TARGET_STRIDE = 3
+TARGET_CSP = 0
+TARGET_MODE = 1
+TARGET_VALID = 2
+
+TARGETS_SIZE = TARGET_BASE + MAX_DRIVES * TARGET_STRIDE

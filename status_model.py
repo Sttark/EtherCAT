@@ -38,6 +38,13 @@ class NetworkStatus:
     jitter_p99_us: Optional[int] = None
     jitter_p999_us: Optional[int] = None
     deadline_miss_count: int = 0
+    overrun_count: int = 0
+    max_overrun_ns: int = 0
+    last_work_ns: Optional[int] = None
+    max_work_ns: int = 0
+    work_p99_ns: Optional[int] = None
+    last_send_interval_ns: Optional[int] = None
+    min_sleep_budget_ns: Optional[int] = None
     domain_wc: Optional[int] = None
     domain_wc_state: Optional[int] = None
     domain_wc_min: Optional[int] = None
