@@ -150,6 +150,7 @@ class EthercatNetworkConfig:
     process_timing_log_period_s: float = 1.0
     process_op_transition_log: bool = True
     dc_reference_slave: Optional[int] = None
+    dc_settling_delay_s: float = 2.0
     # SDO operation timeout and control
     sdo_timeout_s: float = 2.0
     fault_error_code_sdo_fallback: bool = True

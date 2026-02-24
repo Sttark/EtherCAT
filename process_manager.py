@@ -33,6 +33,7 @@ from . import shm_layout as SHM
 
 logger = logging.getLogger(__name__)
 
+AL_STATE_SAFEOP = 0x04
 AL_STATE_OP = 0x08
 FAULT_CODE_LABELS: Dict[int, str] = {
     0x0000: "No error",
@@ -247,6 +248,11 @@ class EtherCATProcess:
         self._all_op_first_ns: Optional[int] = None
         self._all_op_last_ns: Optional[int] = None
         self._all_left_op_last_ns: Optional[int] = None
+        self.slave_in_safeop: Dict[int, bool] = {}
+        self._all_safeop_first_ns: Optional[int] = None
+        self._all_safeop_logged: bool = False
+        self._dc_settling_complete: bool = False
+        self._dc_settling_logged: bool = False
         self._fault_active_last: Dict[int, bool] = {}
         self._fault_error_code_last: Dict[int, Optional[int]] = {}
         self._op_timeout_active: bool = False
@@ -688,6 +694,7 @@ class EtherCATProcess:
 
             for dcfg in self.cfg.slaves:
                 self.slave_in_op[dcfg.position] = False
+                self.slave_in_safeop[dcfg.position] = False
                 self.last_al_state[dcfg.position] = None
                 self._pp_pulse_active[dcfg.position] = False
                 self._pp_pulse_start_ns[dcfg.position] = None
@@ -991,8 +998,11 @@ class EtherCATProcess:
         """
         Automatic CiA 402 state machine - enables drives through state transitions.
         Called every cycle to monitor and transition drives to Operation Enabled.
-        Only runs AFTER slave has reached OP state.
+        Only runs AFTER slave has reached OP state AND DC settling delay has elapsed.
         """
+        if not self._dc_settling_complete:
+            return
+
         period_ns = int(max(self.cfg.enable_transition_period_ms, 1.0) * 1_000_000)
         now_ns = time.monotonic_ns()
 
@@ -1992,12 +2002,21 @@ class EtherCATProcess:
                         if sc is None:
                             continue
                         sc_state = sc.get_state()
+                        al_state = sc_state.get('al_state', 0) if sc_state else 0
+
+                        is_safeop = (al_state >= AL_STATE_SAFEOP)
+                        was_safeop = self.slave_in_safeop.get(pos, False)
+                        if is_safeop and not was_safeop:
+                            self.slave_in_safeop[pos] = True
+                            if bool(getattr(self.cfg, "process_op_transition_log", True)):
+                                self._emit_process_log(f"[DC] Slave {pos} entered SAFEOP (al_state=0x{al_state:02X})")
+
                         is_op = sc_state is not None and sc_state.get('operational', False)
                         was_op = self.slave_in_op[pos]
                         if is_op and not was_op:
                             self.slave_in_op[pos] = True
                             if bool(getattr(self.cfg, "process_op_transition_log", True)):
-                                self._emit_process_log(f"Slave {pos} entered OP (al_state=0x{sc_state.get('al_state', 0):02X})")
+                                self._emit_process_log(f"[DC] Slave {pos} entered OP (al_state=0x{al_state:02X})")
                             if pos not in self._op_entered_first_ns:
                                 self._op_entered_first_ns[pos] = cycle_start_mono
                             self._op_entered_last_ns[pos] = cycle_start_mono
@@ -2008,17 +2027,36 @@ class EtherCATProcess:
                             self._pp_pulse_active[pos] = False
                             self._pp_pulse_start_ns[pos] = None
                             self._pp_pulse_pending[pos] = False
-                            al = sc_state.get('al_state', 0) if sc_state else 0
                             if bool(getattr(self.cfg, "process_op_transition_log", True)):
-                                self._emit_process_log(f"Slave {pos} left OP (al_state=0x{al:02X}, domain WC={wc})")
+                                self._emit_process_log(f"[DC] Slave {pos} left OP (al_state=0x{al_state:02X}, domain WC={wc})")
                             self._op_left_last_ns[pos] = cycle_start_mono
                             self._op_dropout_count[pos] = int(self._op_dropout_count.get(pos, 0)) + 1
+                            self._dc_settling_complete = False
+                            self._dc_settling_logged = False
+
+                    all_in_safeop = bool(self.slave_in_safeop) and all(self.slave_in_safeop.values())
+                    if all_in_safeop and self._all_safeop_first_ns is None:
+                        self._all_safeop_first_ns = cycle_start_mono
+                        if not self._all_safeop_logged:
+                            self._emit_process_log(f"[DC] === ALL {len(self.slave_in_safeop)} SLAVES IN SAFEOP ===")
+                            self._all_safeop_logged = True
 
                     all_in_op = bool(self.slave_in_op) and all(self.slave_in_op.values())
                     if all_in_op:
                         if self._all_op_first_ns is None:
                             self._all_op_first_ns = cycle_start_mono
+                            self._emit_process_log(f"[DC] === ALL {len(self.slave_in_op)} SLAVES IN OP ===")
                         self._all_op_last_ns = cycle_start_mono
+
+                        if not self._dc_settling_complete:
+                            settling_delay_ns = int(getattr(self.cfg, 'dc_settling_delay_s', 2.0) * 1_000_000_000)
+                            elapsed_ns = cycle_start_mono - self._all_op_first_ns
+                            if elapsed_ns >= settling_delay_ns:
+                                self._dc_settling_complete = True
+                                self._emit_process_log(f"[DC] DC settling complete after {elapsed_ns / 1_000_000_000:.2f}s - CiA402 enables allowed")
+                            elif not self._dc_settling_logged:
+                                self._emit_process_log(f"[DC] Waiting for DC settling ({settling_delay_ns / 1_000_000_000:.1f}s)...")
+                                self._dc_settling_logged = True
                     else:
                         self._all_left_op_last_ns = cycle_start_mono
 
