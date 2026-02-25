@@ -1,33 +1,45 @@
 # EtherCAT Overrun Fix - Implementation Summary
 
 **Date**: 2026-02-24  
-**Status**: Changes Applied - Reboot Required
+**Status**: DC Decimation Reverted + Monitoring Added - Ready for Testing
 
 ## Changes Implemented
 
-### 1. DC Sync Monitor Decimation ✓
+### 1. DC Sync Monitor Decimation ⚠️ REVERTED
 
 **File**: `/home/sttark/Desktop/github/EtherCAT/process_manager.py`  
-**Lines**: 2050-2067
+**Lines**: 2159-2175
 
-**Change**: Modified DC sync monitor calls to execute only every 10 cycles instead of every cycle.
+**Original Change**: Modified DC sync monitor calls to execute only every 10 cycles instead of every cycle.
 
-**Impact**:
-- Saves 1 mutex acquisition per 9 out of 10 cycles
-- Reduces `max:cia` phase timing by ~10%
-- No impact on DC sync accuracy (reference_clock and slave_clocks still run every cycle)
+**REVERTED**: 2026-02-24  
+**Reason**: Caused random DC synchronization errors (AL status 0x001A) and slave dropouts from OP state.
 
-**Code**:
+**Root Cause Analysis**:
+- `sync_monitor_queue()` queues datagrams for ongoing DC clock adjustment, not just monitoring
+- Calling it only every 10 cycles (20ms) instead of every cycle (2ms) caused:
+  - Slower DC PLL convergence (1+ second instead of <500ms)
+  - Clock drift accumulation between updates
+  - Random "Synchronization error" when drift exceeded tolerance
+  - Slaves dropping from OP → SAFEOP after 30-60 seconds of operation
+
+**Evidence**:
+- dmesg showed slaves taking 1.2+ seconds to sync (should be <500ms)
+- Random sync errors despite only 1 overrun (RT loop was fine)
+- Working counter drops from 27/27 → 19/27 when slaves lost sync
+- Errors occurred ~40 seconds after reaching OP (drift accumulation)
+
+**Current Status**: REVERTED - `sync_monitor_queue()` now runs every cycle
+
+**Code** (reverted to):
 ```python
-# DC sync monitor decimation: call every 10 cycles instead of every cycle
-# This saves 1 mutex acquisition per skipped cycle with no accuracy loss
-if self.cycle_count % 10 == 0:
-    try:
-        dc_err_ns = self.master.sync_monitor_process()
-        # ... existing error tracking code ...
-        self.master.sync_monitor_queue()
-    except Exception:
-        pass
+# DC sync monitor: MUST run every cycle for proper clock adjustment
+try:
+    dc_err_ns = self.master.sync_monitor_process()
+    # ... error tracking code ...
+    self.master.sync_monitor_queue()  # Critical: runs EVERY cycle
+except Exception:
+    pass
 ```
 
 ### 2. NIC Driver ec_poll Budget Reduction ✓
@@ -85,33 +97,92 @@ enable_transition_period_ms=500.0,
 
 **Impact**: Allows drives 0.5 seconds to respond to commands, reducing retry loops.
 
+### 5. EtherCAT Health Monitoring ✓
+
+**Date**: 2026-02-24  
+**Files**: `EtherCAT/status_model.py`, `EtherCAT/process_manager.py`, `semi_rotary_machine_automation/RPI/interactive_mode.py`
+
+**Changes**: Added comprehensive monitoring **entirely outside RT loop** to diagnose random sync failures:
+
+**Features**:
+- **Working Counter Monitoring**: Detects slaves dropping from OP, alerts with slave list
+- **RT Budget Monitoring**: Tracks work time as % of cycle budget, alerts if >85%
+- **Phase Timing Breakdown**: Detailed timing for each RT loop phase
+- **EC Health Command**: Type `health` in interactive mode for full diagnostic view
+
+**Impact**:
+- Zero RT loop overhead (all analysis in `_publish_status()`)
+- Clear visibility when slaves drop with WC alerts
+- Correlation guidance to check dmesg
+- Identifies if RT performance or DC sync is the issue
+
+See `MONITORING_IMPROVEMENTS.md` for full details.
+
 ## Required Actions
 
-### ⚠️ REBOOT REQUIRED
+### ⚠️ CRITICAL: DC Sync Decimation Reverted
 
-The `force_turbo=1` setting in `/boot/firmware/config.txt` requires a system reboot to take effect.
+**Action**: Restart your EtherCAT application to pick up the reverted DC sync monitoring.
+
+**Why**: The decimation was causing random sync errors and slave dropouts by calling `sync_monitor_queue()` only every 10 cycles instead of every cycle. This function is **critical for ongoing DC clock adjustment**, not just monitoring.
+
+**Expected improvement**:
+- Faster DC convergence (<500ms instead of 1.2+ seconds)
+- No random "Synchronization error" (0x001A) after reaching OP
+- Stable working counter (27/27) without drops
+- Drives enable reliably without getting stuck
+
+### Test with New Monitoring
+
+After restarting, use the new `health` command in interactive mode:
 
 ```bash
-sudo reboot
+sudo python3 RPI/interactive_mode.py
 ```
 
-### After Reboot - Verify
+Then type:
+```
+health
+```
 
-1. **Restart your EtherCAT application**:
-   ```bash
-   sudo python3 RPI/interactive_mode.py
-   ```
+**What to watch for**:
+- WC should stay at 27/27 (no drops)
+- RT budget should be <70% (well within limits)
+- No "WC drop" or "RT budget" warnings in logs
+- All slaves should enable quickly and stay enabled
+- DC sync convergence should be faster (<500ms per slave)
 
-2. **Monitor timing logs** for at least 5 minutes:
-   - Look for `overruns=0` in the `[EC]` timing logs
-   - Verify `min:sleep` stays positive (> 100000 ns)
-   - Check that `max:work` is well under 1000000 ns (1ms cycle time)
+### Verify DC Sync is Working
 
-3. **Expected improvements**:
-   - Zero overruns
-   - `max:cia` reduced from 459µs to < 300µs
-   - `max:recv` reduced from 88µs to < 50µs
-   - More stable/consistent cycle timing
+Monitor dmesg during startup to confirm faster convergence:
+
+```bash
+sudo dmesg -w | grep -E "(Sync after|difference after|Synchronization error)"
+```
+
+**Before reversion**: Slaves took 1200+ms to sync (125868 ns → 9821 ns over 1268ms)  
+**After reversion**: Should sync in <500ms
+
+**Watch for**: No "Synchronization error" messages after slaves reach OP
+
+## Summary
+
+**DC Decimation Reverted**: But convergence STILL takes 4+ seconds (tested with 2 restarts)
+
+**This proves**: Decimation reversion alone doesn't fix the problem. There's a **deeper DC configuration issue**.
+
+**Current Status**:
+- Monitoring added (WC drops, RT budget, `health` command) ✓
+- DC decimation reverted ✓  
+- **Problem persists**: Slaves take 4+ seconds to sync, random 0x001A errors
+
+**Root Cause**: Unknown - investigating:
+1. dc_sync0_shift_ns value (currently 1ms for 2ms cycle)
+2. Mixed DC/non-DC slave configuration
+3. DC reference clock selection
+4. ABB drive-specific DC requirements
+
+**Next Steps**: Test different shift times (125us, 500us, 0us) or try uniform DC config (all drives DC-enabled)
 
 ## Rollback Instructions
 

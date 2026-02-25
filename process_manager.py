@@ -61,6 +61,58 @@ def _wrap_i32(v: int) -> int:
 
 
 class EtherCATProcess:
+    def _boost_igh_master_priority(self) -> None:
+        """Boost IGH EtherCAT master thread to RT priority 99 for fast slave activation"""
+        try:
+            import subprocess
+            import time as time_module
+            
+            # Wait briefly for EtherCAT-OP thread to spawn after activation
+            time_module.sleep(0.1)
+            
+            # Find and boost IGH master thread (retry a few times)
+            for attempt in range(5):
+                result = subprocess.run(
+                    ["ps", "-eLo", "pid,comm"],
+                    capture_output=True, text=True, timeout=2
+                )
+                
+                # Boost IGH master thread to priority 99
+                for line in result.stdout.splitlines():
+                    if "EtherCAT-OP" in line or "EtherCAT-IDLE" in line:
+                        parts = line.split()
+                        if parts:
+                            pid = int(parts[0])
+                            ret = subprocess.run(
+                                ["chrt", "-f", "-p", "99", str(pid)],
+                                capture_output=True, timeout=2
+                            )
+                            if ret.returncode == 0:
+                                self._emit_process_log(f"[EC] Boosted IGH master thread (PID {pid}) to RT priority 99")
+                            else:
+                                self._emit_process_log(f"[EC] Failed to boost IGH (PID {pid}): {ret.stderr.decode()}", stderr=True)
+                            break
+                else:
+                    # Thread not found, wait and retry
+                    if attempt < 4:
+                        time_module.sleep(0.05)
+                        continue
+                    self._emit_process_log("[EC] IGH master thread not found for priority boost", stderr=True)
+                break
+            
+            # Boost NIC IRQ thread to priority 98
+            for line in result.stdout.splitlines():
+                if "irq/115" in line or "eth%d" in line:
+                    parts = line.split()
+                    if parts:
+                        pid = int(parts[0])
+                        subprocess.run(["chrt", "-f", "-p", "98", str(pid)], timeout=2)
+                        self._emit_process_log(f"[EC] Boosted NIC IRQ thread (PID {pid}) to RT priority 98")
+                        break
+                        
+        except Exception as e:
+            self._emit_process_log(f"[EC] Failed to boost RT priorities: {e}", stderr=True)
+    
     def _apply_irq_affinity(self) -> None:
         rules = getattr(self.cfg, "irq_affinity", None)
         if not isinstance(rules, dict) or not rules:
@@ -253,6 +305,16 @@ class EtherCATProcess:
         self._all_safeop_logged: bool = False
         self._dc_settling_complete: bool = False
         self._dc_settling_logged: bool = False
+        
+        # Working counter monitoring (non-RT analysis)
+        self._domain_wc_drop_count: int = 0
+        self._last_wc_alert_cycle: int = 0
+        self._wc_expected: int = 0
+        self._slave_was_in_op: Dict[int, bool] = {}
+        
+        # RT budget monitoring (non-RT analysis)
+        self._rt_budget_warnings: int = 0
+        self._last_rt_alert_cycle: int = 0
         self._fault_active_last: Dict[int, bool] = {}
         self._fault_error_code_last: Dict[int, Optional[int]] = {}
         self._op_timeout_active: bool = False
@@ -302,7 +364,16 @@ class EtherCATProcess:
     def _emit_process_log(self, message: str, stderr: Optional[bool] = None) -> None:
         if stderr is None:
             stderr = bool(getattr(self.cfg, "process_log_stderr", True))
-        line = message if message.endswith("\n") else (message + "\n")
+        
+        # Add dmesg-style timestamp for state transition logs
+        if any(x in message for x in ['entered OP', 'left OP', 'entered SAFEOP', 'CIA402']):
+            from datetime import datetime
+            ts = datetime.now().strftime('[%a %b %d %H:%M:%S %Y]')
+            line = f"{ts} {message}"
+        else:
+            line = message
+            
+        line = line if line.endswith("\n") else (line + "\n")
         if self._log_q is not None:
             try:
                 self._log_q.put_nowait((line, bool(self._process_log_file), stderr))
@@ -639,12 +710,16 @@ class EtherCATProcess:
                         f"CiA402 slave {dcfg.position} requires 0x6040/0x6041 mapped. Missing: {', '.join(missing)}"
                     )
 
+            # Select DC reference clock first
             dc_ref_pos = getattr(self.cfg, 'dc_reference_slave', None)
+            selected_dc_ref = None
+            
             if dc_ref_pos is not None:
                 s = self.slave_handles.get(dc_ref_pos)
                 if s:
                     self.master.select_reference_clock(s)
-                    logger.info(f"Selected slave {dc_ref_pos} as DC reference clock (explicit config)")
+                    logger.info(f"[DC] Selected slave {dc_ref_pos} as DC reference clock (explicit)")
+                    selected_dc_ref = dc_ref_pos
                 else:
                     logger.error(f"dc_reference_slave={dc_ref_pos} not found in slave_handles")
             else:
@@ -653,10 +728,54 @@ class EtherCATProcess:
                         s = self.slave_handles.get(dcfg.position)
                         if s:
                             self.master.select_reference_clock(s)
-                            logger.info(f"Selected slave {dcfg.position} as DC reference clock (first DC-enabled)")
+                            logger.info(f"[DC] Selected slave {dcfg.position} as DC reference clock (auto, first DC-enabled)")
+                            selected_dc_ref = dcfg.position
                             break
 
-            initial_time_ns = int(time.time() * 1_000_000_000)
+            # Sync app_time to slave DC clock to minimize DC convergence time
+            pi_time_ns = int(time.time() * 1_000_000_000)
+            initial_time_ns = pi_time_ns
+            
+            # Read slave DC time if we have a DC reference
+            if selected_dc_ref is not None:
+                try:
+                    import subprocess
+                    
+                    # Use ethercat reg_read for ESC register 0x0910 (DC system time, 8 bytes)
+                    result = subprocess.run(
+                        ["ethercat", "reg_read", "-p", str(selected_dc_ref), "0x0910", "8"],
+                        capture_output=True,
+                        text=True,
+                        timeout=0.5
+                    )
+                    
+                    if result.returncode == 0:
+                        # Parse hex bytes: "0xXX 0xXX 0xXX ..." format
+                        hex_bytes = [int(x, 16) for x in result.stdout.strip().split()]
+                        if len(hex_bytes) == 8:
+                            slave_dc_time = int.from_bytes(bytes(hex_bytes), 'little')
+                            offset_ms = abs(pi_time_ns - slave_dc_time) / 1_000_000
+                            
+                            # Log to stderr for immediate visibility
+                            print(f"[DC] Pi time:         {pi_time_ns} ns", file=sys.stderr, flush=True)
+                            print(f"[DC] Slave {selected_dc_ref} DC time: {slave_dc_time} ns", file=sys.stderr, flush=True)
+                            print(f"[DC] Initial offset:  {offset_ms:.1f} ms", file=sys.stderr, flush=True)
+                            
+                            if offset_ms > 50:
+                                initial_time_ns = slave_dc_time
+                                print(f"[DC] ✓ Using slave DC time as app_time", file=sys.stderr, flush=True)
+                            else:
+                                print(f"[DC] Offset <50ms, using Pi time", file=sys.stderr, flush=True)
+                        else:
+                            print(f"[DC] Parse error: {result.stdout}", file=sys.stderr, flush=True)
+                    else:
+                        print(f"[DC] ethercat upload failed (rc={result.returncode}): {result.stderr[:100]}", file=sys.stderr, flush=True)
+                        
+                except subprocess.TimeoutExpired:
+                    print(f"[DC] Timeout reading slave DC time", file=sys.stderr, flush=True)
+                except Exception as e:
+                    print(f"[DC] Error: {e}", file=sys.stderr, flush=True)
+            
             try:
                 self.master.set_application_time(initial_time_ns)
             except Exception:
@@ -690,6 +809,9 @@ class EtherCATProcess:
 
             self.master.activate()
             logger.info("Master activated")
+            
+            # Boost IGH master thread AFTER activation (when EtherCAT-OP spawns)
+            self._boost_igh_master_priority()
             self._activated_mono_ns = time.monotonic_ns()
 
             for dcfg in self.cfg.slaves:
@@ -1163,6 +1285,57 @@ class EtherCATProcess:
         status.all_slaves_op_last_ns = self._all_op_last_ns
         status.all_slaves_left_op_last_ns = self._all_left_op_last_ns
         status.sdo_only = self.cfg.sdo_only
+        
+        # === NON-RT MONITORING: Working Counter Drops ===
+        wc = self._last_domain_wc
+        if wc is not None and self._wc_expected > 0:
+            if wc < self._wc_expected:
+                self._domain_wc_drop_count += 1
+                
+                # Alert every 500 cycles (~1 second at 2ms)
+                if (self.cycle_count - self._last_wc_alert_cycle) >= 500:
+                    missing = self._wc_expected - wc
+                    slaves_missing = [p for p, in_op in self.slave_in_op.items() if not in_op]
+                    
+                    logger.warning(
+                        f"[EC] WC {wc}/{self._wc_expected} (missing {missing} slaves). "
+                        f"Not in OP: {slaves_missing}. Check dmesg for 'Synchronization error'."
+                    )
+                    self._last_wc_alert_cycle = self.cycle_count
+        
+        status.domain_wc_drop_count = self._domain_wc_drop_count
+        status.domain_wc_expected = self._wc_expected
+        status.slaves_not_in_op = [p for p, in_op in self.slave_in_op.items() if not in_op]
+        
+        # === NON-RT MONITORING: RT Budget Usage ===
+        work_ns = self._last_work_ns
+        if work_ns is not None:
+            cycle_budget_ns = int(self.cfg.cycle_time_ms * 1_000_000)
+            usage_percent = (work_ns / cycle_budget_ns) * 100.0
+            
+            # Alert if using >85% of budget
+            if usage_percent > 85.0:
+                self._rt_budget_warnings += 1
+                
+                if (self.cycle_count - self._last_rt_alert_cycle) >= 1000:
+                    logger.warning(
+                        f"[EC] RT budget {usage_percent:.1f}% "
+                        f"(work={work_ns/1000:.1f}us / budget={cycle_budget_ns/1000:.1f}us). "
+                        f"Datagrams may be skipped!"
+                    )
+                    self._last_rt_alert_cycle = self.cycle_count
+            
+            status.rt_budget_usage_percent = usage_percent
+            status.rt_budget_warnings = self._rt_budget_warnings
+        
+        # Add detailed phase timing to status
+        status.phase_recv_ns = self._phase_recv
+        status.phase_state_ns = self._phase_state
+        status.phase_cia_ns = self._phase_cia
+        status.phase_ruckig_ns = self._phase_ruckig
+        status.phase_write_ns = self._phase_write
+        status.phase_dc_send_ns = self._phase_dc_send
+        
         for slave_pos, entries in self.offsets.items():
             drive = {}
             drive['in_op'] = self.slave_in_op.get(slave_pos, False)
@@ -2046,6 +2219,12 @@ class EtherCATProcess:
                         if self._all_op_first_ns is None:
                             self._all_op_first_ns = cycle_start_mono
                             self._emit_process_log(f"[DC] === ALL {len(self.slave_in_op)} SLAVES IN OP ===")
+                            
+                            # Set expected working counter for non-RT monitoring
+                            if not self.cfg.sdo_only and self.domain is not None:
+                                if self._wc_expected == 0:
+                                    self._wc_expected = self._last_domain_wc
+                                    self._emit_process_log(f"[EC] Expected WC set to {self._wc_expected}")
                         self._all_op_last_ns = cycle_start_mono
 
                         if not self._dc_settling_complete:
@@ -2091,21 +2270,19 @@ class EtherCATProcess:
                         pass
                     self.master.sync_reference_clock()
                     self.master.sync_slave_clocks()
-                    # DC sync monitor decimation: call every 10 cycles instead of every cycle
-                    # This saves 1 mutex acquisition per skipped cycle with no accuracy loss
-                    if self.cycle_count % 10 == 0:
-                        try:
-                            dc_err_ns = self.master.sync_monitor_process()
-                            if dc_err_ns is not None:
-                                dc_err_ns = int(dc_err_ns)
-                                self._last_dc_sync_error_ns = dc_err_ns
-                                self._window_append(self._dc_sync_error_window_ns, self._dc_sync_sorted_ns, dc_err_ns)
-                                abs_dc = abs(dc_err_ns)
-                                if abs_dc > self._max_abs_dc_sync_error_ns:
-                                    self._max_abs_dc_sync_error_ns = abs_dc
-                            self.master.sync_monitor_queue()
-                        except Exception:
-                            pass
+                    # DC sync monitor: MUST run every cycle for proper clock adjustment
+                    try:
+                        dc_err_ns = self.master.sync_monitor_process()
+                        if dc_err_ns is not None:
+                            dc_err_ns = int(dc_err_ns)
+                            self._last_dc_sync_error_ns = dc_err_ns
+                            self._window_append(self._dc_sync_error_window_ns, self._dc_sync_sorted_ns, dc_err_ns)
+                            abs_dc = abs(dc_err_ns)
+                            if abs_dc > self._max_abs_dc_sync_error_ns:
+                                self._max_abs_dc_sync_error_ns = abs_dc
+                        self.master.sync_monitor_queue()
+                    except Exception:
+                        pass
 
                     self.master.queue_domain(self.domain)
                     self.master.send()
