@@ -434,6 +434,29 @@ class EtherCATProcess:
         shm[SHM.SLOT_ALL_OP_LAST_NS] = int(self._all_op_last_ns or 0)
         shm[SHM.SLOT_ALL_OP_LEFT_LAST_NS] = int(self._all_left_op_last_ns or 0)
         shm[SHM.SLOT_CYCLE_TIME_MS_X1000] = int(self.cfg.cycle_time_ms * 1000)
+        for slave_pos, entries in self.offsets.items():
+            if slave_pos in self._cia402_positions:
+                continue
+            dcfg = next((d for d in self.cfg.slaves if d.position == slave_pos), None)
+            if dcfg is None:
+                continue
+            reg_entries = getattr(dcfg, 'register_entries', None) or []
+            di_idx = 0
+            do_idx = 0
+            for key in reg_entries:
+                if key not in entries:
+                    continue
+                idx = key[0] if isinstance(key, tuple) else key
+                if 0x6000 <= idx < 0x6040:
+                    if di_idx < SHM.SLOT_IO_DI_COUNT:
+                        raw = self.master.read_domain(self.domain, entries[key], 1) or b"\x00"
+                        shm[SHM.SLOT_IO_DI_BASE + di_idx] = raw[0]
+                        di_idx += 1
+                elif 0x7040 <= idx < 0x7080:
+                    if do_idx < SHM.SLOT_IO_DO_COUNT:
+                        raw = self.master.read_domain(self.domain, entries[key], 1) or b"\x00"
+                        shm[SHM.SLOT_IO_DO_BASE + do_idx] = raw[0]
+                        do_idx += 1
         cache = self._pdo_cache
         for slave_pos, entries in self.offsets.items():
             if slave_pos >= SHM.MAX_DRIVES:
@@ -2523,6 +2546,24 @@ class EtherCATProcessManager:
             drive = {}
             drive['in_op'] = bool(shm[base + SHM.DRIVE_IN_OP])
             drive['enabled'] = bool(shm[base + SHM.DRIVE_ENABLED])
+            if not getattr(dcfg, 'cia402', True):
+                raw_pdo = {}
+                reg_entries = getattr(dcfg, 'register_entries', None) or []
+                di_idx = 0
+                do_idx = 0
+                for key in reg_entries:
+                    idx = key[0] if isinstance(key, tuple) else key
+                    if 0x6000 <= idx < 0x6040:
+                        if di_idx < SHM.SLOT_IO_DI_COUNT:
+                            raw_pdo[key] = int(shm[SHM.SLOT_IO_DI_BASE + di_idx])
+                            di_idx += 1
+                    elif 0x7040 <= idx < 0x7080:
+                        if do_idx < SHM.SLOT_IO_DO_COUNT:
+                            raw_pdo[key] = int(shm[SHM.SLOT_IO_DO_BASE + do_idx])
+                            do_idx += 1
+                drive['raw_pdo'] = raw_pdo
+                status.drives[pos] = drive
+                continue
             drive['statusword'] = int(shm[base + SHM.DRIVE_STATUSWORD])
             drive['position_actual'] = int(shm[base + SHM.DRIVE_POSITION])
             drive['velocity_actual'] = int(shm[base + SHM.DRIVE_VELOCITY])
