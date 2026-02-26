@@ -1073,7 +1073,13 @@ class EtherCATProcess:
                 }
                 self.last_mode_cmd[die_pos] = MODE_CSP
                 self.last_mode_cmd[shuttle_pos] = MODE_CSP
+                shuttle_center = int(params["shuttle_center"])
+                self._csp_target_next[shuttle_pos] = shuttle_center
+                self._csp_target_cur[shuttle_pos] = shuttle_center
+                if self._ruckig_planner:
+                    self._ruckig_planner.stop(shuttle_pos)
                 self._ruckig_last_error[die_pos] = None
+                self._ruckig_last_error[shuttle_pos] = None
             except Exception as e:
                 self._semi_rotary_rt["active"] = False
                 self._semi_rotary_rt["error"] = str(e)
@@ -2282,6 +2288,7 @@ class EtherCATProcess:
                     self._auto_enable_drives()
                     _t_cia = time.monotonic_ns()
                     self._update_ruckig()
+                    self._update_semi_rotary_rt()
                     _t_ruckig = time.monotonic_ns()
                     self._read_targets_from_shm()
                     self._cyclic_write()
