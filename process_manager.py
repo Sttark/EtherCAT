@@ -1646,8 +1646,18 @@ class EtherCATProcess:
                     logger.error("Ruckig not available - cannot start die velocity test")
                     return
                 
-                current_pos = self._read_pdo_cached(die_pos, POSITION_ACTUAL_INDEX) or 0
-                current_vel = self._read_pdo_cached(die_pos, VELOCITY_ACTUAL_INDEX) or 0
+                entries = self.offsets.get(die_pos, {})
+                if (POSITION_ACTUAL_INDEX, 0) not in entries:
+                    logger.error(f"Die velocity test requires 0x6064 (position actual) mapped in PDO for slave {die_pos}")
+                    return
+                if (VELOCITY_ACTUAL_INDEX, 0) not in entries:
+                    logger.error(f"Die velocity test requires 0x606C (velocity actual) mapped in PDO for slave {die_pos}")
+                    return
+                
+                raw_p = self.master.read_domain(self.domain, entries[(POSITION_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                raw_v = self.master.read_domain(self.domain, entries[(VELOCITY_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                current_pos = int.from_bytes(raw_p, "little", signed=True)
+                current_vel = float(int.from_bytes(raw_v, "little", signed=True))
                 
                 self._die_velocity_integrator = RuckigVelocityIntegrator(
                     dt_s, max_velocity, max_acceleration, max_jerk
