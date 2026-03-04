@@ -881,8 +881,16 @@ class EtherCATProcess:
             base = SHM.DRIVE_BASE + slave_pos * SHM.DRIVE_STRIDE
             c = cache.get(slave_pos)
             shm[base + SHM.DRIVE_STATUSWORD] = c.get('sw', 0) if c else 0
-            shm[base + SHM.DRIVE_POSITION] = c.get('pos', 0) if c else 0
-            shm[base + SHM.DRIVE_VELOCITY] = c.get('vel', 0) if c else 0
+            if (POSITION_ACTUAL_INDEX, 0) in entries:
+                raw_p = self.master.read_domain(self.domain, entries[(POSITION_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                shm[base + SHM.DRIVE_POSITION] = int.from_bytes(raw_p, 'little', signed=True)
+            else:
+                shm[base + SHM.DRIVE_POSITION] = 0
+            if (VELOCITY_ACTUAL_INDEX, 0) in entries:
+                raw_v = self.master.read_domain(self.domain, entries[(VELOCITY_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                shm[base + SHM.DRIVE_VELOCITY] = int.from_bytes(raw_v, 'little', signed=True)
+            else:
+                shm[base + SHM.DRIVE_VELOCITY] = 0
             if (TORQUE_ACTUAL_INDEX, 0) in entries:
                 raw = self.master.read_domain(self.domain, entries[(TORQUE_ACTUAL_INDEX, 0)], 2) or b"\x00\x00"
                 shm[base + SHM.DRIVE_TORQUE] = int.from_bytes(raw, 'little', signed=True)
