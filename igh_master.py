@@ -10,12 +10,15 @@ No adapter layer. No dependency on SttarkStandardLibrary / pyethercat.
 """
 
 import ctypes
+import ctypes.util
 import logging
+import os
 import shutil
 import subprocess
 import time
 import threading
-from typing import Optional, Tuple, Dict, Callable
+from pathlib import Path
+from typing import Optional, Tuple, Dict, Callable, Union
 
 
 logger = logging.getLogger(__name__)
@@ -29,12 +32,58 @@ class SDOException(Exception):
     pass
 
 
-# Load the EtherCAT library
-try:
-    _libec = ctypes.CDLL("libethercat.so.1")
-except OSError as e:
-    logger.error(f"Failed to load libethercat.so.1: {e}")
-    _libec = None
+def _load_libethercat() -> Optional[ctypes.CDLL]:
+    """
+    Resolve and load `libethercat.so.1`.
+
+    This needs to work under `sudo` as well (where `LD_LIBRARY_PATH` is often
+    sanitized). Prefer explicit environment configuration when possible.
+    """
+    env_path = os.getenv("LIBETHERCAT_SO_PATH") or os.getenv("LIBETHERCAT_SO")
+    if env_path:
+        try:
+            p = Path(env_path).expanduser()
+            lib_path = str(p)
+        except Exception:
+            lib_path = env_path
+        try:
+            return ctypes.CDLL(lib_path)
+        except OSError as e:
+            logger.error(f"Failed to load libethercat from {lib_path!r}: {e}")
+
+    found = ctypes.util.find_library("ethercat")
+    if found:
+        try:
+            return ctypes.CDLL(found)
+        except OSError as e:
+            logger.error(f"Failed to load libethercat via find_library({found!r}): {e}")
+
+    candidates = [
+        "libethercat.so.1",
+        "/usr/local/lib/libethercat.so.1",
+        "/usr/lib/libethercat.so.1",
+        "/usr/lib/aarch64-linux-gnu/libethercat.so.1",
+        "/lib/aarch64-linux-gnu/libethercat.so.1",
+        "/opt/etherlab/lib/libethercat.so.1",
+    ]
+    last_err: Optional[OSError] = None
+    for c in candidates:
+        try:
+            return ctypes.CDLL(c)
+        except OSError as e:
+            last_err = e
+            continue
+
+    if last_err is not None:
+        logger.error(f"Failed to load libethercat.so.1: {last_err}")
+    logger.error(
+        "libethercat.so.1 not found. Set `LIBETHERCAT_SO_PATH` to the full path "
+        "of the library (e.g. /usr/local/lib/libethercat.so.1)."
+    )
+    return None
+
+
+_libec = _load_libethercat()
 
 
 # Define C types for EtherCAT structures
@@ -160,7 +209,8 @@ if _libec:
     _libec.ecrt_master_deactivate.restype = None
 
     _libec.ecrt_master_application_time.argtypes = [ctypes.POINTER(ec_master_t), ctypes.c_uint64]
-    _libec.ecrt_master_application_time.restype = None
+    # IgH headers specify int return (0 success, <0 error). Most callers ignore it.
+    _libec.ecrt_master_application_time.restype = ctypes.c_int
 
     _libec.ecrt_master.argtypes = [ctypes.POINTER(ec_master_t), ctypes.POINTER(ec_master_info_t)]
     _libec.ecrt_master.restype = ctypes.c_int
@@ -241,6 +291,14 @@ if _libec:
     ]
     _libec.ecrt_slave_config_pdos.restype = ctypes.c_int
 
+    if hasattr(_libec, "ecrt_slave_config_watchdog"):
+        _libec.ecrt_slave_config_watchdog.argtypes = [
+            ctypes.POINTER(ec_slave_config_t),
+            ctypes.c_uint16,
+            ctypes.c_uint16,
+        ]
+        _libec.ecrt_slave_config_watchdog.restype = ctypes.c_int
+
     _libec.ecrt_slave_config_reg_pdo_entry.argtypes = [
         ctypes.POINTER(ec_slave_config_t),
         ctypes.c_uint16,
@@ -288,12 +346,115 @@ if _libec:
     _libec.ecrt_master_sync_slave_clocks.argtypes = [ctypes.POINTER(ec_master_t)]
     _libec.ecrt_master_sync_slave_clocks.restype = ctypes.c_int
 
+    if hasattr(_libec, "ecrt_master_reference_clock_time"):
+        _libec.ecrt_master_reference_clock_time.argtypes = [
+            ctypes.POINTER(ec_master_t),
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        _libec.ecrt_master_reference_clock_time.restype = ctypes.c_int
+
     if hasattr(_libec, "ecrt_master_sync_monitor_queue"):
         _libec.ecrt_master_sync_monitor_queue.argtypes = [ctypes.POINTER(ec_master_t)]
         _libec.ecrt_master_sync_monitor_queue.restype = None
     if hasattr(_libec, "ecrt_master_sync_monitor_process"):
         _libec.ecrt_master_sync_monitor_process.argtypes = [ctypes.POINTER(ec_master_t)]
         _libec.ecrt_master_sync_monitor_process.restype = ctypes.c_uint32
+
+    # --- SDO request objects (mailbox serviced via cyclic send/receive) ---
+    # These APIs are the correct shape for SDO access while in OP (when absolutely required),
+    # because they are queued and processed as part of the normal datagram flow.
+    if hasattr(_libec, "ecrt_slave_config_create_sdo_request"):
+        _libec.ecrt_slave_config_create_sdo_request.argtypes = [
+            ctypes.POINTER(ec_slave_config_t),
+            ctypes.c_uint16,  # index
+            ctypes.c_uint8,   # subindex
+            ctypes.c_size_t,  # size
+        ]
+        _libec.ecrt_slave_config_create_sdo_request.restype = ctypes.POINTER(ec_sdo_request_t)
+
+    if hasattr(_libec, "ecrt_sdo_request_read"):
+        _libec.ecrt_sdo_request_read.argtypes = [ctypes.POINTER(ec_sdo_request_t)]
+        _libec.ecrt_sdo_request_read.restype = ctypes.c_int
+
+    if hasattr(_libec, "ecrt_sdo_request_write"):
+        _libec.ecrt_sdo_request_write.argtypes = [ctypes.POINTER(ec_sdo_request_t)]
+        _libec.ecrt_sdo_request_write.restype = ctypes.c_int
+
+    if hasattr(_libec, "ecrt_sdo_request_state"):
+        _libec.ecrt_sdo_request_state.argtypes = [ctypes.POINTER(ec_sdo_request_t)]
+        _libec.ecrt_sdo_request_state.restype = ctypes.c_int
+
+    if hasattr(_libec, "ecrt_sdo_request_data"):
+        _libec.ecrt_sdo_request_data.argtypes = [ctypes.POINTER(ec_sdo_request_t)]
+        _libec.ecrt_sdo_request_data.restype = ctypes.POINTER(ctypes.c_uint8)
+
+    if hasattr(_libec, "ecrt_sdo_request_size"):
+        _libec.ecrt_sdo_request_size.argtypes = [ctypes.POINTER(ec_sdo_request_t)]
+        _libec.ecrt_sdo_request_size.restype = ctypes.c_size_t
+
+
+# IgH request states (ec_request_state_t). Values are stable across IgH versions.
+# We treat unknown values conservatively.
+EC_REQUEST_UNUSED = 0
+EC_REQUEST_BUSY = 1
+EC_REQUEST_SUCCESS = 2
+EC_REQUEST_ERROR = 3
+
+
+class SdoRequest:
+    """
+    Thin wrapper for an IgH ec_sdo_request_t* created from a slave config.
+
+    The request is serviced by the kernel/master as part of the normal cyclic
+    datagram flow (queue read/write before send; poll state after receive).
+    """
+
+    def __init__(self, req: ctypes.POINTER(ec_sdo_request_t), max_size: int) -> None:
+        self._req = req
+        self._max_size = int(max_size)
+
+    @property
+    def max_size(self) -> int:
+        return self._max_size
+
+    def queue_read(self) -> int:
+        if _libec is None or not hasattr(_libec, "ecrt_sdo_request_read"):
+            raise MasterException("IgH SDO request API not available: ecrt_sdo_request_read")
+        return int(_libec.ecrt_sdo_request_read(self._req))
+
+    def queue_write(self, data: Union[bytes, bytearray, memoryview]) -> int:
+        if _libec is None or not hasattr(_libec, "ecrt_sdo_request_write"):
+            raise MasterException("IgH SDO request API not available: ecrt_sdo_request_write")
+        if _libec is None or not hasattr(_libec, "ecrt_sdo_request_data"):
+            raise MasterException("IgH SDO request API not available: ecrt_sdo_request_data")
+        b = bytes(data)
+        if len(b) > self._max_size:
+            raise ValueError(f"SDO write too large: {len(b)} > max_size={self._max_size}")
+        buf = _libec.ecrt_sdo_request_data(self._req)
+        if not bool(buf):
+            raise MasterException("ecrt_sdo_request_data returned NULL")
+        ctypes.memmove(buf, b, len(b))
+        return int(_libec.ecrt_sdo_request_write(self._req))
+
+    def state(self) -> int:
+        if _libec is None or not hasattr(_libec, "ecrt_sdo_request_state"):
+            raise MasterException("IgH SDO request API not available: ecrt_sdo_request_state")
+        return int(_libec.ecrt_sdo_request_state(self._req))
+
+    def read_data(self) -> bytes:
+        if _libec is None or not hasattr(_libec, "ecrt_sdo_request_data"):
+            raise MasterException("IgH SDO request API not available: ecrt_sdo_request_data")
+        if _libec is None or not hasattr(_libec, "ecrt_sdo_request_size"):
+            raise MasterException("IgH SDO request API not available: ecrt_sdo_request_size")
+        size = int(_libec.ecrt_sdo_request_size(self._req))
+        if size < 0:
+            size = 0
+        if size > self._max_size:
+            size = self._max_size
+        buf = _libec.ecrt_sdo_request_data(self._req)
+        if not bool(buf):
+            return b""
+        return bytes(ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8 * size)).contents)
 
 
 class SlaveConfig:
@@ -346,6 +507,21 @@ class SlaveConfig:
             'operational': bool(state.operational),
             'al_state': int(state.al_state),
         }
+
+    def create_sdo_request(self, index: int, subindex: int, size: int) -> SdoRequest:
+        if not self._config_handle:
+            raise MasterException("Cannot create SDO request - no config handle")
+        if _libec is None or not hasattr(_libec, "ecrt_slave_config_create_sdo_request"):
+            raise MasterException("IgH SDO request API not available: ecrt_slave_config_create_sdo_request")
+        req = _libec.ecrt_slave_config_create_sdo_request(
+            self._config_handle,
+            int(index) & 0xFFFF,
+            int(subindex) & 0xFF,
+            ctypes.c_size_t(int(size)),
+        )
+        if not bool(req):
+            raise MasterException(f"Failed to create SDO request 0x{int(index):04X}:{int(subindex)} size={int(size)}")
+        return SdoRequest(req=req, max_size=int(size))
 
     def config_dc(self, assign_activate: int, sync0_cycle_time_ns: int,
                   sync0_shift_ns: int = 0, sync1_cycle_time_ns: int = 0,
@@ -635,6 +811,33 @@ class Master:
                 f"Failed to register SDO config: index=0x{index:04X}, subindex={subindex}, result={result}")
         return True
 
+    def slave_config_watchdog(self, slave_config: SlaveConfig, watchdog_divider: int, watchdog_intervals: int) -> bool:
+        """
+        Configure the slave ESC SyncManager watchdog times (registers 0x0400, 0x0420).
+
+        This is NOT a CoE SDO; it is an IgH configuration call and must be done
+        before activation.
+        """
+        if not slave_config._config_handle:
+            raise MasterException("Slave not configured")
+        if not _libec:
+            raise MasterException("libethercat not loaded")
+        div = int(watchdog_divider) & 0xFFFF
+        itv = int(watchdog_intervals) & 0xFFFF
+        if not hasattr(_libec, "ecrt_slave_config_watchdog"):
+            raise MasterException("IgH watchdog API not available in libethercat")
+        result = _libec.ecrt_slave_config_watchdog(
+            slave_config._config_handle,
+            ctypes.c_uint16(div),
+            ctypes.c_uint16(itv),
+        )
+        if result != 0:
+            raise MasterException(
+                f"Failed to configure watchdog for slave {slave_config.position}: {result} "
+                f"(divider={div}, intervals={itv})"
+            )
+        return True
+
     def activate(self) -> bool:
         if not self._master_handle:
             raise MasterException("Master not requested")
@@ -680,16 +883,32 @@ class Master:
         if self._master_handle and self._activated:
             _libec.ecrt_master_sync_slave_clocks(self._master_handle)
 
+    def reference_clock_time_32(self) -> Optional[int]:
+        """
+        Returns the lower 32 bits of the reference clock's System Time (ns),
+        or None if not available yet (no ref clock, or sync datagram not received).
+        """
+        if not (self._master_handle and self._activated):
+            return None
+        if not hasattr(_libec, "ecrt_master_reference_clock_time"):
+            return None
+        t = ctypes.c_uint32(0)
+        rc = int(_libec.ecrt_master_reference_clock_time(self._master_handle, ctypes.byref(t)))
+        if rc != 0:
+            return None
+        return int(t.value)
+
     def sync_monitor_queue(self):
         if self._master_handle and self._activated and hasattr(_libec, "ecrt_master_sync_monitor_queue"):
             _libec.ecrt_master_sync_monitor_queue(self._master_handle)
 
     def sync_monitor_process(self) -> Optional[int]:
         if self._master_handle and self._activated and hasattr(_libec, "ecrt_master_sync_monitor_process"):
-            v = int(_libec.ecrt_master_sync_monitor_process(self._master_handle))
-            if v == 0xFFFFFFFF:
+            v_u32 = int(_libec.ecrt_master_sync_monitor_process(self._master_handle)) & 0xFFFF_FFFF
+            if v_u32 == 0xFFFF_FFFF:
                 return None
-            return v
+            # IgH returns a 32-bit value; treat it as signed ns error.
+            return int(ctypes.c_int32(v_u32).value)
         return None
 
     def get_slave_count(self) -> int:

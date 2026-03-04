@@ -27,6 +27,8 @@ class CommandType(Enum):
     START_SEMI_ROTARY_RT = auto()
     UPDATE_SEMI_ROTARY_RT = auto()
     STOP_SEMI_ROTARY_RT = auto()
+    START_DIE_VELOCITY_TEST = auto()
+    STOP_DIE_VELOCITY_TEST = auto()
 
     # Drive state
     ENABLE_DRIVE = auto()

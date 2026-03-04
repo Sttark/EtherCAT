@@ -1,3 +1,237 @@
+# Jetson RT Tuning Guide (IgH EtherCAT + Python)
+
+This guide focuses on low-jitter operation on NVIDIA Jetson with PREEMPT_RT when running:
+
+- IgH EtherCAT master
+- EtherCAT NIC IRQ path
+- Python EtherCAT application tasks
+
+The target setup is to keep all EtherCAT real-time work on one dedicated CPU core.
+
+## 1) Scope and assumptions
+
+Assumptions:
+
+- Jetson Linux is already installed (NVIDIA standard BSP flow)
+- PREEMPT_RT kernel is installed and booted
+- IgH EtherCAT is built and working
+- EtherCAT NIC is dedicated to fieldbus traffic
+
+Check first:
+
+```bash
+uname -a
+cat /sys/kernel/realtime
+cat /proc/cmdline
+```
+
+Expected:
+
+- PREEMPT_RT kernel is active
+- `/sys/kernel/realtime` is `1`
+
+## 2) Jetson baseline (NVIDIA standard RT practice)
+
+Set deterministic clocks and power mode before latency tuning:
+
+```bash
+sudo nvpmodel -m 0
+sudo jetson_clocks
+```
+
+Notes:
+
+- Use a fixed high-performance mode during control runtime.
+- Keep thermal headroom (fan profile, cooling) to avoid frequency throttling.
+
+## 3) Disable UEFI runtime services during Linux runtime
+
+For hard real-time behavior on Jetson (UEFI boot chain platforms), disable EFI runtime services from Linux:
+
+- add `efi=noruntime` to kernel command line
+
+On Jetson this is typically done in `/boot/extlinux/extlinux.conf` by appending to the active `APPEND` line.
+
+Example:
+
+```conf
+APPEND ${cbootargs} ... efi=noruntime
+```
+
+Then reboot and verify:
+
+```bash
+cat /proc/cmdline
+```
+
+Look for `efi=noruntime`.
+
+Why:
+
+- removes EFI runtime callbacks from normal kernel runtime paths
+- reduces a class of unpredictable firmware interactions
+
+## 4) Reserve one CPU core for EtherCAT RT path
+
+Pick one dedicated core. Example in this guide: `CPU 2`.
+
+Add these kernel args (same `APPEND` line):
+
+```conf
+isolcpus=2 nohz_full=2 rcu_nocbs=2
+```
+
+Recommended combined example:
+
+```conf
+APPEND ${cbootargs} ... efi=noruntime isolcpus=2 nohz_full=2 rcu_nocbs=2
+```
+
+Then reboot.
+
+Notes:
+
+- `isolcpus` keeps normal scheduler load off CPU 2.
+- `nohz_full` reduces periodic scheduler ticks on CPU 2.
+- `rcu_nocbs` offloads RCU callbacks away from CPU 2.
+
+## 5) Pin IgH master OP thread to the same core
+
+Set `ec_master` CPU pinning through modprobe options:
+
+`/etc/modprobe.d/ec_master.conf`
+
+```conf
+options ec_master run_on_cpu=2
+```
+
+Reload EtherCAT stack (or reboot):
+
+```bash
+sudo systemctl restart ethercat
+```
+
+Verify:
+
+```bash
+cat /sys/module/ec_master/parameters/run_on_cpu
+```
+
+Expected: `2`
+
+## 6) Pin EtherCAT NIC IRQs to the same core
+
+Find EtherCAT NIC IRQs and set affinity to CPU 2.
+
+Identify IRQs:
+
+```bash
+grep -iE 'eth|enp|r8169|igc|stmmac' /proc/interrupts
+```
+
+Set affinity list for each EtherCAT NIC IRQ:
+
+```bash
+echo 2 | sudo tee /proc/irq/<IRQ_NUMBER>/smp_affinity_list
+```
+
+Persist this with a systemd oneshot service that runs after network and before starting your control app.
+
+Example script:
+
+`/usr/local/sbin/pin-ethercat-irqs.sh`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+TARGET_CPU="2"
+NIC_NAME="eth1"
+
+for irq in $(grep -i "${NIC_NAME}" /proc/interrupts | cut -d: -f1 | tr -d ' '); do
+  echo "${TARGET_CPU}" > "/proc/irq/${irq}/smp_affinity_list"
+done
+```
+
+Then call it from a root-owned systemd unit at boot.
+
+## 7) Pin the EtherCAT service and Python app to CPU 2
+
+### 7.1 EtherCAT service affinity
+
+Add a drop-in:
+
+`/etc/systemd/system/ethercat.service.d/cpu-affinity.conf`
+
+```ini
+[Service]
+CPUAffinity=2
+```
+
+Apply:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart ethercat
+```
+
+### 7.2 Python control application affinity
+
+Use a systemd unit (preferred) or `taskset`.
+
+Systemd example:
+
+```ini
+[Service]
+ExecStart=/usr/bin/python3 /path/to/main.py
+CPUAffinity=2
+```
+
+Or manual run:
+
+```bash
+taskset -c 2 python3 /path/to/main.py
+```
+
+## 8) Keep non-RT noise off the EtherCAT core
+
+Best practices:
+
+- Keep NetworkManager off the EtherCAT interface.
+- Avoid logging-heavy or monitoring tasks on CPU 2.
+- Keep GPU/vision/AI user-space workloads on other cores.
+- Do not place unrelated IRQs on CPU 2.
+
+Optional:
+
+- disable `irqbalance` if it fights your manual IRQ pinning.
+- explicitly pin heavy daemons to housekeeping CPUs (`0,1,3-...`).
+
+## 9) Verification checklist
+
+Run these checks after every reboot:
+
+```bash
+cat /proc/cmdline
+cat /sys/module/ec_master/parameters/run_on_cpu
+ps -eo pid,psr,comm | grep -E 'ethercat|python'
+grep -iE 'eth1|enp|r8169|igc|stmmac' /proc/interrupts
+for i in /proc/irq/*/smp_affinity_list; do grep -H "^2$" "$i" || true; done
+```
+
+You should see:
+
+- `efi=noruntime isolcpus=2 nohz_full=2 rcu_nocbs=2` in cmdline
+- `ec_master` pinned to CPU 2
+- Python control process running on CPU 2
+- EtherCAT NIC IRQs targeting CPU 2
+
+## 10) Practical tuning notes
+
+- One-core isolation is simple and robust for moderate bus loads.
+- If jitter rises at high load, split IRQ and user tasks across two RT cores.
+- Re-check affinity after kernel, driver, or NIC naming changes.
+- Keep configuration in systemd/modprobe files, not manual shell history.
 # EtherCAT Real-Time Tuning Guide
 
 Reference document for achieving reliable 1ms (and sub-1ms) EtherCAT cycle times on Raspberry Pi 5 with IgH EtherCAT Master and PREEMPT_RT kernel.

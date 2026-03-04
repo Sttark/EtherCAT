@@ -1,0 +1,14 @@
+[Unit]
+Description=Claim Intel i210 from native igb to ec_igb
+DefaultDependencies=no
+After=ethercat.service
+Before=network.target
+Requires=ethercat.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/jetson-claim-i210-ec_igb.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

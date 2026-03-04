@@ -33,7 +33,12 @@ class StatusProxy:
         if not self._last:
             return None
         drive = self._last.drives.get(slave_position) or {}
-        return drive.get(key)
+        result = drive.get(key)
+        if slave_position == 3 and key == 'dip_in_state':
+            import sys
+            sys.stdout.write(f"[CLIENT-DEBUG] Slave 3 get_field('dip_in_state'): result={result}, drive_keys={list(drive.keys())[:20]}\n")
+            sys.stdout.flush()
+        return result
 
 
 def attach_drive_handle(

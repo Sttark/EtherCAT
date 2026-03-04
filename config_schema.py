@@ -94,6 +94,13 @@ class DriveConfig:
     pt_requires_setpoint_toggle: bool = False
     cia402: bool = True
     startup_sdos: List[Tuple[int, int, bytes]] = field(default_factory=list)
+    # IgH SyncManager watchdog (ESC registers 0x0400, 0x0420).
+    # If set, ProcessManager will configure watchdog times before activation.
+    # Timeout is applied best-effort; values are clamped to valid register ranges.
+    sm_watchdog_timeout_ms: Optional[float] = None
+    # Watchdog divider in 40ns units (register 0x0400). If None, a conservative
+    # divider will be chosen when timeout_ms is set.
+    sm_watchdog_divider: Optional[int] = None
     sync_configs: Optional[List] = None
     register_entries: Optional[List[Tuple[int, int]]] = None
     pdo_read_sizes: Dict[Tuple[int, int], int] = field(default_factory=dict)
@@ -105,6 +112,9 @@ class EthercatNetworkConfig:
     network_interface: Optional[str] = None
     cycle_time_ms: float = 5.0
     cpu_core: Optional[int] = None
+    # Optional: pin IgH master kernel thread ("EtherCAT-OP"/"EtherCAT-IDLE") to a housekeeping core.
+    # Applied best-effort at runtime via `taskset` from the EtherCAT cyclic process.
+    igh_master_cpu_core: Optional[int] = None
     rt_priority: Optional[int] = None
     irq_affinity: Dict[int, str] = field(default_factory=dict)
     sdo_only: bool = False
@@ -150,7 +160,20 @@ class EthercatNetworkConfig:
     process_timing_log_period_s: float = 1.0
     process_op_transition_log: bool = True
     dc_reference_slave: Optional[int] = None
+    # How to handle DC master/slave synchronization.
+    # - "m2s": master disciplines its app_time from the reference slave clock; do not sync ref to Linux time.
+    # - "s2m": sync the reference slave clock to the application's (Linux) time.
+    dc_master_sync_mode: str = "m2s"
+    # M2S time discipline tuning. In M2S, app_time is a smoothed/PLL-tracked version
+    # of the reference clock time (not a direct copy) to avoid injecting datagram jitter.
+    dc_m2s_k: float = 0.01
+    dc_m2s_window: int = 11
+    dc_m2s_max_correction_ns: int = 20_000
     dc_settling_delay_s: float = 2.0
+    # Optional default SyncManager watchdog configuration (applies to slaves that
+    # do not override it via DriveConfig.*). See ecrt_slave_config_watchdog().
+    sm_watchdog_timeout_ms: Optional[float] = None
+    sm_watchdog_divider: Optional[int] = None
     # SDO operation timeout and control
     sdo_timeout_s: float = 2.0
     fault_error_code_sdo_fallback: bool = True

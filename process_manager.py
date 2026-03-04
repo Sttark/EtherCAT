@@ -9,7 +9,22 @@ import sys
 import time
 import traceback
 from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+_parent = Path(__file__).resolve().parent.parent
+if str(_parent) not in sys.path:
+    sys.path.insert(0, str(_parent))
+
+_semi_rotary_rpi = _parent / "semi_rotary_machine_automation" / "RPI"
+if _semi_rotary_rpi.is_dir() and str(_semi_rotary_rpi) not in sys.path:
+    sys.path.insert(0, str(_semi_rotary_rpi))
+
+try:
+    from lib.trajectory_core import RuckigVelocityIntegrator, ContinuousRotationTrajectory, RUCKIG_AVAILABLE as RUCKIG_AVAILABLE_CORE
+except ImportError:
+    from RPI.lib.trajectory_core import RuckigVelocityIntegrator, ContinuousRotationTrajectory, RUCKIG_AVAILABLE as RUCKIG_AVAILABLE_CORE
 
 from .commands import Command, CommandType
 from .status_model import NetworkStatus
@@ -25,16 +40,26 @@ from .constants import (
     PROBE_FUNC_ENABLE_PROBE1, PROBE_FUNC_PROBE1_POS_EDGE, PROBE_FUNC_PROBE1_NEG_EDGE,
 )
 from .config_schema import EthercatNetworkConfig, DriveConfig
-from .igh_master import Master, MasterException, SDOException
+from .igh_master import (
+    Master, MasterException, SDOException,
+    EC_REQUEST_BUSY, EC_REQUEST_ERROR, EC_REQUEST_SUCCESS,
+)
 from .xml_decoder import decode_esi
 from .ruckig_planner import RuckigCspPlanner, RuckigUnavailable
 from . import shm_layout as SHM
+
+
+try:
+    import ruckig
+except ImportError:
+    ruckig = None
 
 
 logger = logging.getLogger(__name__)
 
 AL_STATE_SAFEOP = 0x04
 AL_STATE_OP = 0x08
+_SM_WD_DEFAULT_DIVIDER_40NS = 2500  # 2500 * 40ns = 100us base interval
 FAULT_CODE_LABELS: Dict[int, str] = {
     0x0000: "No error",
     0x1000: "Generic error",
@@ -60,7 +85,330 @@ def _wrap_i32(v: int) -> int:
     return ((v + 0x8000_0000) % 0x1_0000_0000) - 0x8000_0000
 
 
+class _RefClock32Extender:
+    """
+    Extend a wrapping 32-bit nanosecond counter to a monotonic 64-bit value.
+
+    IgH exposes the lower 32 bits of the reference clock's system time, which wraps
+    every ~4.29s. We extend it in userspace so we can feed a stable `app_time`.
+    """
+
+    def __init__(self) -> None:
+        self._last32: Optional[int] = None
+        self._ext64: int = 0
+
+    def seed_near(self, target64: int, cur32: int) -> int:
+        """
+        Seed the extended clock so that the 32-bit sample is placed near `target64`.
+
+        This prevents catastrophic app_time jumps when switching from a fallback
+        timebase to reference-clock-based time.
+        """
+        cur32 = int(cur32) & 0xFFFF_FFFF
+        target64 = int(target64)
+
+        base = target64 & ~0xFFFF_FFFF
+        cand = base | cur32
+
+        # Pick the closest of {cand-2^32, cand, cand+2^32}.
+        step = 0x1_0000_0000
+        best = cand
+        best_err = abs(best - target64)
+        alt = cand - step
+        alt_err = abs(alt - target64)
+        if alt_err < best_err:
+            best, best_err = alt, alt_err
+        alt = cand + step
+        alt_err = abs(alt - target64)
+        if alt_err < best_err:
+            best = alt
+
+        self._last32 = cur32
+        self._ext64 = int(best)
+        return self._ext64
+
+    def update(self, cur32: int) -> int:
+        cur32 = int(cur32) & 0xFFFF_FFFF
+        if self._last32 is None:
+            self._last32 = cur32
+            self._ext64 = cur32
+            return self._ext64
+
+        last32 = self._last32
+        delta = (cur32 - last32) & 0xFFFF_FFFF
+
+        # If the delta looks like a large backwards jump (glitch), ignore this sample.
+        # Legitimate forward wrap produces a small delta after modulo subtraction.
+        if delta > 0x8000_0000:
+            return self._ext64
+
+        self._ext64 += delta
+        self._last32 = cur32
+        return self._ext64
+
+
+def _median_i64(values: List[int]) -> int:
+    if not values:
+        return 0
+    s = sorted(int(v) for v in values)
+    return int(s[len(s) // 2])
+
+
+@dataclass
+class _SdoReqSlot:
+    slave_pos: int
+    index: int
+    subindex: int
+    req: Any
+    max_size: int
+    # Desired operations (set by callers; queued by queue_due()).
+    desired_read: bool = False
+    desired_write: Optional[bytes] = None
+    desired_write_hash: Optional[int] = None
+    # Inflight tracking
+    inflight: bool = False
+    inflight_kind: Optional[str] = None  # "read" | "write"
+    inflight_write_hash: Optional[int] = None
+    last_queue_cycle: int = -10**12
+    last_success_cycle: int = -10**12
+    last_error_cycle: int = -10**12
+    last_error: Optional[str] = None
+    last_success_write_hash: Optional[int] = None
+    # Read cache
+    cached_read: Optional[bytes] = None
+    cached_read_cycle: int = -10**12
+    # Dedup/backoff knobs (in cycles)
+    read_min_interval_cycles: int = 500  # default 1s @2ms
+    write_backoff_cycles: int = 10       # default 20ms @2ms
+
+
+class _SdoRequestManager:
+    """
+    Manage IgH SDO request objects in the cyclic process, with strict dedup/backoff.
+
+    - Call `poll()` after `receive()` to collect completions.
+    - Call `queue_due()` before `send()` to queue any desired operations.
+    """
+
+    def __init__(self) -> None:
+        self._slots: Dict[Tuple[int, int, int], _SdoReqSlot] = {}
+
+    def register(self, slave_pos: int, index: int, subindex: int, req: Any, max_size: int) -> None:
+        key = (int(slave_pos), int(index), int(subindex))
+        self._slots[key] = _SdoReqSlot(
+            slave_pos=int(slave_pos),
+            index=int(index),
+            subindex=int(subindex),
+            req=req,
+            max_size=int(max_size),
+        )
+
+    def has(self, slave_pos: int, index: int, subindex: int) -> bool:
+        return (int(slave_pos), int(index), int(subindex)) in self._slots
+
+    def set_desired_read(self, slave_pos: int, index: int, subindex: int, *, min_interval_cycles: Optional[int] = None) -> None:
+        slot = self._slots.get((int(slave_pos), int(index), int(subindex)))
+        if slot is None:
+            return
+        slot.desired_read = True
+        if min_interval_cycles is not None:
+            slot.read_min_interval_cycles = max(1, int(min_interval_cycles))
+
+    def clear_desired_read(self, slave_pos: int, index: int, subindex: int) -> None:
+        slot = self._slots.get((int(slave_pos), int(index), int(subindex)))
+        if slot is None:
+            return
+        slot.desired_read = False
+
+    def set_desired_write(self, slave_pos: int, index: int, subindex: int, data: bytes, *, backoff_cycles: Optional[int] = None) -> None:
+        slot = self._slots.get((int(slave_pos), int(index), int(subindex)))
+        if slot is None:
+            return
+        b = bytes(data)
+        slot.desired_write = b
+        slot.desired_write_hash = hash(b)
+        if backoff_cycles is not None:
+            slot.write_backoff_cycles = max(1, int(backoff_cycles))
+
+    def get_cached_read(
+        self,
+        slave_pos: int,
+        index: int,
+        subindex: int,
+        *,
+        cycle_count: int,
+        max_age_cycles: int = 500,
+    ) -> Optional[bytes]:
+        slot = self._slots.get((int(slave_pos), int(index), int(subindex)))
+        if slot is None:
+            return None
+        if slot.cached_read is None:
+            return None
+        if int(max_age_cycles) <= 0:
+            return slot.cached_read
+        age = int(cycle_count) - int(slot.cached_read_cycle)
+        if age <= int(max_age_cycles):
+            return slot.cached_read
+        return None
+
+    def poll(self, cycle_count: int) -> None:
+        cc = int(cycle_count)
+        for slot in self._slots.values():
+            if not slot.inflight:
+                continue
+            try:
+                st = int(slot.req.state())
+            except Exception as e:
+                slot.inflight = False
+                slot.last_error_cycle = cc
+                slot.last_error = f"state() failed: {e}"
+                continue
+            if st == EC_REQUEST_BUSY:
+                continue
+            if st == EC_REQUEST_SUCCESS:
+                slot.inflight = False
+                slot.last_success_cycle = cc
+                slot.last_error = None
+                if slot.inflight_kind == "read":
+                    try:
+                        slot.cached_read = bytes(slot.req.read_data())
+                        slot.cached_read_cycle = cc
+                    except Exception as e:
+                        slot.last_error_cycle = cc
+                        slot.last_error = f"read_data() failed: {e}"
+                elif slot.inflight_kind == "write":
+                    slot.last_success_write_hash = slot.inflight_write_hash
+                slot.inflight_kind = None
+                slot.inflight_write_hash = None
+                continue
+            if st == EC_REQUEST_ERROR:
+                slot.inflight = False
+                slot.last_error_cycle = cc
+                slot.last_error = "request state=ERROR"
+                slot.inflight_kind = None
+                slot.inflight_write_hash = None
+                continue
+            # Unknown state: treat as not busy but not successful.
+            slot.inflight = False
+            slot.last_error_cycle = cc
+            slot.last_error = f"unknown request state={st}"
+            slot.inflight_kind = None
+            slot.inflight_write_hash = None
+
+    def queue_due(self, cycle_count: int) -> None:
+        cc = int(cycle_count)
+        for slot in self._slots.values():
+            if slot.inflight:
+                continue
+
+            # Prefer writes over reads if both are desired.
+            if slot.desired_write is not None:
+                # Dedup: if desired value is same as last successful write and no error since, skip.
+                if slot.desired_write_hash is not None and slot.desired_write_hash == slot.last_success_write_hash:
+                    # Still allow retry if we had a recent error.
+                    if slot.last_error_cycle > slot.last_success_cycle:
+                        pass
+                    else:
+                        slot.desired_write = None
+                        continue
+                if (cc - int(slot.last_queue_cycle)) < int(slot.write_backoff_cycles):
+                    continue
+                try:
+                    slot.req.queue_write(slot.desired_write)
+                    slot.inflight = True
+                    slot.inflight_kind = "write"
+                    slot.inflight_write_hash = slot.desired_write_hash
+                    slot.last_queue_cycle = cc
+                    # Keep desired_write until success to allow retry on error; cleared in poll() on success via hash dedup above.
+                except Exception as e:
+                    slot.last_error_cycle = cc
+                    slot.last_error = f"queue_write failed: {e}"
+                continue
+
+            if slot.desired_read:
+                if (cc - int(slot.last_queue_cycle)) < int(slot.read_min_interval_cycles):
+                    continue
+                try:
+                    slot.req.queue_read()
+                    slot.inflight = True
+                    slot.inflight_kind = "read"
+                    slot.last_queue_cycle = cc
+                except Exception as e:
+                    slot.last_error_cycle = cc
+                    slot.last_error = f"queue_read failed: {e}"
+
+    def clear_all_desired(self) -> None:
+        """
+        Stop queueing any new SDO request-object operations.
+
+        Note: does not cancel in-flight mailbox operations (IgH doesn't expose a safe cancel),
+        but prevents additional queue pressure during unstable network periods.
+        """
+        for slot in self._slots.values():
+            slot.desired_read = False
+            slot.desired_write = None
+            slot.desired_write_hash = None
+
 class EtherCATProcess:
+    def _sdo_queue_allowed_now(self) -> bool:
+        """
+        Gate runtime SDO request-object traffic in PDO (cyclic) mode.
+
+        During DC sync faults / WC drops / OP dropouts, mailbox traffic can increase bus load
+        and interfere with recovery. By default, we only queue SDOs when the network is healthy.
+        """
+        if not bool(getattr(self.cfg, "enable_runtime_sdo_requests", True)):
+            return False
+
+        # Default-on guards (can be overridden via config).
+        guard_all_op = bool(getattr(self.cfg, "sdo_queue_only_when_all_slaves_op", True))
+        guard_dc_settled = bool(getattr(self.cfg, "sdo_queue_only_when_dc_settled", True))
+        guard_wc_ok = bool(getattr(self.cfg, "sdo_queue_only_when_wc_ok", True))
+
+        if guard_all_op:
+            if not self.slave_in_op or (not all(self.slave_in_op.values())):
+                return False
+
+        if guard_dc_settled and (not bool(getattr(self, "_dc_settling_complete", False))):
+            return False
+
+        if guard_wc_ok:
+            wc = self._last_domain_wc
+            if self._wc_expected > 0 and wc is not None and int(wc) < int(self._wc_expected):
+                return False
+
+        return True
+    def _setup_runtime_sdo_requests_for_slave(self, slave_pos: int, sc: Any, *, is_cia402: bool) -> bool:
+        """
+        Create IgH SDO request objects for runtime mailbox access (OP-safe shape).
+
+        These requests are serviced via the cyclic send/receive flow. We create them
+        once during setup and then only queue/poll them in the cyclic loop.
+        """
+        if not is_cia402:
+            return True
+        if not bool(getattr(self.cfg, "enable_runtime_sdo_requests", True)):
+            return True
+        req_specs = [
+            (ERROR_CODE_INDEX, 0, 2),          # 0x603F Error code
+            (MODES_OP_INDEX, 0, 1),            # 0x6060 Modes of operation
+            (TARGET_VELOCITY_INDEX, 0, 4),     # 0x60FF Target velocity
+            (TARGET_TORQUE_INDEX, 0, 2),       # 0x6071 Target torque
+            (TARGET_POSITION_INDEX, 0, 4),     # 0x607A Target position
+            (PROBE_FUNCTION_INDEX, 0, 2),      # 0x60B8 Touch probe function
+        ]
+        for idx, sub, size in req_specs:
+            try:
+                req = sc.create_sdo_request(int(idx), int(sub), int(size))
+                self._sdo_mgr.register(int(slave_pos), int(idx), int(sub), req=req, max_size=int(size))
+            except Exception as e:
+                self._emit_process_log(
+                    f"[EC] Failed to create SDO request object slave={slave_pos} 0x{int(idx):04X}:{int(sub)} size={int(size)}: {e}",
+                    stderr=True,
+                )
+                return False
+        return True
+
     def _boost_igh_master_priority(self) -> None:
         """Boost IGH EtherCAT master thread to RT priority 99 for fast slave activation"""
         try:
@@ -69,6 +417,15 @@ class EtherCATProcess:
             
             # Wait briefly for EtherCAT-OP thread to spawn after activation
             time_module.sleep(0.1)
+
+            igh_core_raw = getattr(self.cfg, "igh_master_cpu_core", None)
+            igh_core: Optional[int] = None
+            if igh_core_raw is not None:
+                try:
+                    igh_core = int(igh_core_raw)
+                except Exception:
+                    self._emit_process_log(f"[EC] Invalid igh_master_cpu_core={igh_core_raw!r}", stderr=True)
+                    igh_core = None
             
             # Find and boost IGH master thread (retry a few times)
             for attempt in range(5):
@@ -91,6 +448,28 @@ class EtherCATProcess:
                                 self._emit_process_log(f"[EC] Boosted IGH master thread (PID {pid}) to RT priority 99")
                             else:
                                 self._emit_process_log(f"[EC] Failed to boost IGH (PID {pid}): {ret.stderr.decode()}", stderr=True)
+
+                            if igh_core is not None:
+                                try:
+                                    # Note: this PID is the thread ID (TID) from `ps -eLo`.
+                                    ts = subprocess.run(
+                                        ["taskset", "-pc", str(igh_core), str(pid)],
+                                        capture_output=True, text=True, timeout=2
+                                    )
+                                    if ts.returncode == 0:
+                                        out = (ts.stdout or "").strip()
+                                        self._emit_process_log(f"[EC] Pinned IGH master thread (TID {pid}) to CPU {igh_core}: {out}")
+                                    else:
+                                        err = (ts.stderr or "").strip()
+                                        self._emit_process_log(
+                                            f"[EC] Failed to pin IGH master thread (TID {pid}) to CPU {igh_core}: {err}",
+                                            stderr=True,
+                                        )
+                                except Exception as e:
+                                    self._emit_process_log(
+                                        f"[EC] Failed to pin IGH master thread (TID {pid}) to CPU {igh_core}: {e}",
+                                        stderr=True,
+                                    )
                             break
                 else:
                     # Thread not found, wait and retry
@@ -100,15 +479,28 @@ class EtherCATProcess:
                     self._emit_process_log("[EC] IGH master thread not found for priority boost", stderr=True)
                 break
             
-            # Boost NIC IRQ thread to priority 98
-            for line in result.stdout.splitlines():
-                if "irq/115" in line or "eth%d" in line:
-                    parts = line.split()
-                    if parts:
-                        pid = int(parts[0])
-                        subprocess.run(["chrt", "-f", "-p", "98", str(pid)], timeout=2)
-                        self._emit_process_log(f"[EC] Boosted NIC IRQ thread (PID {pid}) to RT priority 98")
-                        break
+            # Boost NIC IRQ thread(s) to priority 98 (based on configured irq_affinity keys).
+            rules = getattr(self.cfg, "irq_affinity", None)
+            irqs: List[int] = []
+            if isinstance(rules, dict):
+                for irq_raw in rules.keys():
+                    try:
+                        irqs.append(int(irq_raw))
+                    except Exception:
+                        continue
+            if irqs:
+                for irq in sorted(set(irqs)):
+                    for line in result.stdout.splitlines():
+                        if f"irq/{irq}" in line:
+                            parts = line.split()
+                            if parts:
+                                pid = int(parts[0])
+                                try:
+                                    subprocess.run(["chrt", "-f", "-p", "98", str(pid)], timeout=2)
+                                    self._emit_process_log(f"[EC] Boosted IRQ thread irq/{irq} (TID {pid}) to RT priority 98")
+                                except Exception as e:
+                                    self._emit_process_log(f"[EC] Failed to boost IRQ thread irq/{irq} (TID {pid}): {e}", stderr=True)
+                            break
                         
         except Exception as e:
             self._emit_process_log(f"[EC] Failed to boost RT priorities: {e}", stderr=True)
@@ -194,12 +586,9 @@ class EtherCATProcess:
         self._last_mode_sdo: Dict[int, Optional[int]] = {}
         self._last_velocity_sdo: Dict[int, Optional[int]] = {}
         self._last_torque_sdo: Dict[int, Optional[int]] = {}
+        self._last_position_sdo: Dict[int, Optional[int]] = {}
         self.last_probe_arm: Dict[int, Optional[int]] = {}
-        
-        # SDO result cache: {(slave_pos, index, subindex): (result_bytes, timestamp)}
-        self._sdo_cache: Dict[Tuple[int, int, int], Tuple[Optional[bytes], float]] = {}
-        # SDO request tracking: {(slave_pos, index, subindex): timestamp} to avoid duplicate requests
-        self._sdo_pending: Dict[Tuple[int, int, int], float] = {}
+        self._sdo_mgr = _SdoRequestManager()
         self.pdo_maps: Dict[int, Dict[str, Dict[int, list]]] = {}
         # CiA 402 state machine tracking
         self.enable_step: Dict[int, int] = {}  # Fault reset attempt counter
@@ -233,6 +622,18 @@ class EtherCATProcess:
         self._cia402_positions: set = set()
         self._raw_pdo_writes: Dict[int, Dict[Tuple[int, int], bytes]] = {}
         self._status_publish_count: int = 0
+        self._dc_master_sync_mode = str(getattr(cfg, "dc_master_sync_mode", "m2s") or "m2s").strip().lower()
+        # Pure M2S (master to reference slave) timebase.
+        self._m2s_ref_ext = _RefClock32Extender()
+        self._m2s_last_app_time_ns: Optional[int] = None
+        self._m2s_logged_mode: bool = False
+        self._m2s_logged_fallback: bool = False
+        self._m2s_logged_lock: bool = False
+        self._m2s_ref_time_ns: Optional[int] = None
+        self._m2s_phase_err_window: deque = deque(maxlen=max(1, int(getattr(cfg, "dc_m2s_window", 11) or 11)))
+        self._m2s_k: float = float(getattr(cfg, "dc_m2s_k", 0.01) or 0.01)
+        self._m2s_max_correction_ns: int = int(getattr(cfg, "dc_m2s_max_correction_ns", 20_000) or 20_000)
+        self._m2s_logged_pll: bool = False
         self._jitter_warmup_cycles: int = max(0, int(getattr(self.cfg, "jitter_warmup_cycles", 0)))
         self._deadline_miss_threshold_ns: int = int(getattr(self.cfg, "deadline_miss_threshold_ns", 0) or 0)
         if self._deadline_miss_threshold_ns <= 0:
@@ -258,6 +659,7 @@ class EtherCATProcess:
         self._prev_send_mono: Optional[int] = None
         self._last_send_interval_ns: Optional[int] = None
         self._min_sleep_budget_ns: Optional[int] = None
+        self._min_sleep_budget_window_ns: Optional[int] = None
         self._last_publish_ns: int = 0
         self._max_publish_ns: int = 0
         self._jitter_sorted_ns: list = []
@@ -274,12 +676,14 @@ class EtherCATProcess:
         self._phase_ruckig: int = 0
         self._phase_write: int = 0
         self._phase_dc_send: int = 0
+        self._phase_tail: int = 0
         self._phase_recv_max: int = 0
         self._phase_state_max: int = 0
         self._phase_cia_max: int = 0
         self._phase_ruckig_max: int = 0
         self._phase_write_max: int = 0
         self._phase_dc_send_max: int = 0
+        self._phase_tail_max: int = 0
         self._log_actual_sum: int = 0
         self._log_jitter_sum: int = 0
         self._log_lateness_max: int = 0
@@ -353,7 +757,20 @@ class EtherCATProcess:
             "rev_count_rt": None,
             "blend_rt": None,
             "comp_raw_rt": None,
+            "die_commanded_position": None,
+            "target_counts_per_rev": None,
+            "velocity_ramp_rate": 100000.0,
+            "phase_offset": 0.0,
+            "die_velocity_counts_per_s": None,
+            "target_velocity_counts_per_s": None,
         }
+        
+        self._die_velocity_test_active = False
+        self._die_velocity_integrator = None
+        self._die_test_target_rpm = 0.0
+        self._die_test_target_velocity = 0.0
+        self._die_test_pos = 0
+        
         raw_process_log_file = getattr(self.cfg, "process_log_file", None)
         if raw_process_log_file is None:
             self._process_log_file = None
@@ -475,6 +892,12 @@ class EtherCATProcess:
             if (ERROR_CODE_INDEX, 0) in entries:
                 raw = self.master.read_domain(self.domain, entries[(ERROR_CODE_INDEX, 0)], 2) or b"\x00\x00"
                 shm[base + SHM.DRIVE_ERROR_CODE] = int.from_bytes(raw, 'little')
+            if (DIGITAL_INPUTS_INDEX, 0) in entries:
+                raw = self.master.read_domain(self.domain, entries[(DIGITAL_INPUTS_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                shm[base + SHM.DRIVE_DIGITAL_INPUTS] = int.from_bytes(raw, 'little')
+            if (DIP_IN_STATE_INDEX, 1) in entries:
+                raw = self.master.read_domain(self.domain, entries[(DIP_IN_STATE_INDEX, 1)], 4) or b"\x00\x00\x00\x00"
+                shm[base + SHM.DRIVE_DIP_IN_STATE] = int.from_bytes(raw, 'little')
             shm[base + SHM.DRIVE_IN_OP] = 1 if self.slave_in_op.get(slave_pos, False) else 0
             shm[base + SHM.DRIVE_ENABLED] = 1 if (self.drive_enabled.get(slave_pos, False) and not self._manual_disable.get(slave_pos, False)) else 0
         shm[SHM.SLOT_SEQUENCE] = int(self.cycle_count)
@@ -521,47 +944,89 @@ class EtherCATProcess:
                 error_code = int.from_bytes(raw_ec, "little")
                 if error_code not in (None, 0):
                     return error_code, "pdo"
-        
-        # Try cached SDO result
-        sdo_key = (slave_pos, ERROR_CODE_INDEX, 0)
-        if sdo_key in self._sdo_cache:
-            cached_result, _ = self._sdo_cache[sdo_key]
-            if cached_result and len(cached_result) >= 2:
-                ec = int.from_bytes(cached_result[:2], "little")
-                if ec != 0:
-                    return ec, "sdo_cached"
-        
-        # Spawn async SDO request if not already pending
+
+        # If we don't have a runtime SDO request object registered, we cannot use SDO-request-object fallback.
+        if not self._sdo_mgr.has(int(slave_pos), int(ERROR_CODE_INDEX), 0):
+            return None, "unavailable"
+
+        # Try cached SDO-request-object result (serviced via cyclic send/receive).
+        cache_age_cycles = int(getattr(self.cfg, "fault_error_code_cache_max_age_cycles", 500) or 500)
+        cached = self._sdo_mgr.get_cached_read(
+            slave_pos, ERROR_CODE_INDEX, 0,
+            cycle_count=int(self.cycle_count),
+            max_age_cycles=cache_age_cycles,
+        )
+        if cached and len(cached) >= 2:
+            ec = int.from_bytes(cached[:2], "little")
+            if ec != 0:
+                return ec, "sdo_req_cached"
+
+        # Queue (deduped) SDO read via request object.
         if bool(getattr(self.cfg, "fault_error_code_sdo_fallback", True)):
-            now = time.time()
-            # Only spawn if not pending or last request was >5s ago (avoid spam)
-            if sdo_key not in self._sdo_pending or (now - self._sdo_pending[sdo_key]) > 5.0:
-                self._sdo_pending[sdo_key] = now
-                
-                def error_code_callback(result, error):
-                    # Store result in cache
-                    self._sdo_cache[sdo_key] = (result, time.time())
-                    # Remove from pending
-                    self._sdo_pending.pop(sdo_key, None)
-                    
-                    if error is None and result and len(result) >= 2:
-                        ec = int.from_bytes(result[:2], "little")
-                        if ec != 0:
-                            ec_label = self._fault_code_label(ec)
-                            logger.info(f"[SDO async] Slave {slave_pos}: Error code 0x{ec:04X} ({ec_label})")
-                    elif error is not None:
-                        logger.warning(f"[SDO async] Slave {slave_pos}: Error code read failed: {error}")
-                
-                timeout_s = float(getattr(self.cfg, "sdo_timeout_s", 2.0))
-                self.master.sdo_upload_async(
-                    slave_pos, ERROR_CODE_INDEX, 0,
-                    max_size=2, timeout_s=timeout_s,
-                    callback=error_code_callback
-                )
-        
-        if error_code is not None:
-            return error_code, "pdo"
+            if not self._sdo_queue_allowed_now():
+                return None, "sdo_req_suppressed"
+            min_interval = int(getattr(self.cfg, "fault_error_code_read_min_interval_cycles", 500) or 500)
+            self._sdo_mgr.set_desired_read(
+                slave_pos, ERROR_CODE_INDEX, 0,
+                min_interval_cycles=min_interval,
+            )
+            return None, "sdo_req_pending"
+
         return None, "unavailable"
+
+    def _configure_sync_manager_watchdog(self, dcfg: DriveConfig, s) -> None:
+        """
+        Best-effort configure the ESC SyncManager watchdog for a slave.
+
+        This targets AL 0x001B "Sync manager watchdog" by adjusting the slave's
+        watchdog divider (reg 0x0400) and intervals (reg 0x0420) using the IgH
+        configuration API (ecrt_slave_config_watchdog). This is NOT a CoE SDO.
+        """
+        timeout_ms = getattr(dcfg, "sm_watchdog_timeout_ms", None)
+        if timeout_ms is None:
+            timeout_ms = getattr(self.cfg, "sm_watchdog_timeout_ms", None)
+        if timeout_ms is None:
+            env = os.getenv("ETHERCAT_SM_WATCHDOG_TIMEOUT_MS")
+            if env is not None and env.strip():
+                try:
+                    timeout_ms = float(env.strip())
+                except ValueError:
+                    timeout_ms = None
+        if timeout_ms is None:
+            return
+
+        try:
+            timeout_ms_f = float(timeout_ms)
+        except Exception:
+            return
+        if timeout_ms_f <= 0.0:
+            return
+
+        divider = getattr(dcfg, "sm_watchdog_divider", None)
+        if divider is None:
+            divider = getattr(self.cfg, "sm_watchdog_divider", None)
+        if divider is None:
+            divider = _SM_WD_DEFAULT_DIVIDER_40NS
+
+        try:
+            divider_i = int(divider)
+        except Exception:
+            divider_i = _SM_WD_DEFAULT_DIVIDER_40NS
+        divider_i = max(1, min(0xFFFF, divider_i))
+
+        base_ns = divider_i * 40  # per ecrt.h
+        intervals = int(round((timeout_ms_f * 1_000_000.0) / float(base_ns)))
+        intervals = max(1, min(0xFFFF, intervals))
+
+        try:
+            self.master.slave_config_watchdog(s, divider_i, intervals)
+            approx_ms = (intervals * base_ns) / 1_000_000.0
+            logger.info(
+                f"Slave {dcfg.position}: SM watchdog configured "
+                f"(divider={divider_i}, intervals={intervals}, approx={approx_ms:.1f}ms)"
+            )
+        except Exception as e:
+            logger.warning(f"Slave {dcfg.position}: SM watchdog config failed: {e}")
 
     def _setup(self) -> bool:
         # Open/request the master with or without PDO based on config
@@ -594,6 +1059,11 @@ class EtherCATProcess:
 
             if getattr(dcfg, 'cia402', True):
                 self._cia402_positions.add(dcfg.position)
+
+            if not self._setup_runtime_sdo_requests_for_slave(dcfg.position, s, is_cia402=bool(getattr(dcfg, "cia402", True))):
+                return False
+
+            self._configure_sync_manager_watchdog(dcfg, s)
 
             for (idx, sub, data) in getattr(dcfg, 'startup_sdos', []):
                 self.master.slave_config_sdo(s, idx, sub, data)
@@ -690,6 +1160,14 @@ class EtherCATProcess:
                     'rx': rx_pdo_map,
                     'tx': tx_pdo_map,
                 }
+                
+                sys.stdout.write(f"[SETUP] Slave {dcfg.position}: Registered {len(offsets)} PDO entries\n")
+                if (DIP_IN_STATE_INDEX, 1) in offsets:
+                    sys.stdout.write(f"[SETUP] Slave {dcfg.position}: 0x4020:1 registered at offset {offsets[(DIP_IN_STATE_INDEX, 1)]}\n")
+                else:
+                    sys.stdout.write(f"[SETUP] Slave {dcfg.position}: 0x4020:1 NOT registered!\n")
+                    sys.stdout.write(f"[SETUP] Slave {dcfg.position}: Available entries: {[(hex(k[0]), k[1]) for k in list(offsets.keys())[:10]]}\n")
+                sys.stdout.flush()
 
             self.features[dcfg.position] = supports
             auto_en = getattr(self.cfg, "auto_enable_cia402", True)
@@ -700,13 +1178,14 @@ class EtherCATProcess:
             if dcfg.enable_dc and not self.cfg.sdo_only:
                 cycle_time_ns = int(self.cfg.cycle_time_ms * 1_000_000)
                 dc_assign = dcfg.dc_assign_activate if dcfg.dc_assign_activate is not None else 0x0300
+                sync0_cycle = int(dcfg.dc_sync0_cycle_time_ns) if dcfg.dc_sync0_cycle_time_ns is not None else cycle_time_ns
                 sync0_shift = dcfg.dc_sync0_shift_ns
                 sync1_cycle = dcfg.dc_sync1_cycle_time_ns
                 sync1_shift = dcfg.dc_sync1_shift_ns
 
                 s.config_dc(
                     assign_activate=dc_assign,
-                    sync0_cycle_time_ns=cycle_time_ns,
+                    sync0_cycle_time_ns=sync0_cycle,
                     sync0_shift_ns=sync0_shift,
                     sync1_cycle_time_ns=sync1_cycle,
                     sync1_shift_ns=sync1_shift
@@ -755,52 +1234,25 @@ class EtherCATProcess:
                             selected_dc_ref = dcfg.position
                             break
 
-            # Sync app_time to slave DC clock to minimize DC convergence time
-            pi_time_ns = int(time.time() * 1_000_000_000)
-            initial_time_ns = pi_time_ns
-            
-            # Read slave DC time if we have a DC reference
-            if selected_dc_ref is not None:
-                try:
-                    import subprocess
-                    
-                    # Use ethercat reg_read for ESC register 0x0910 (DC system time, 8 bytes)
-                    result = subprocess.run(
-                        ["ethercat", "reg_read", "-p", str(selected_dc_ref), "0x0910", "8"],
-                        capture_output=True,
-                        text=True,
-                        timeout=0.5
+            if not self._m2s_logged_mode:
+                if self._dc_master_sync_mode == "m2s":
+                    self._emit_process_log(
+                        f"[DC] Master clock mode=M2S (app_time <- reference_clock_time_32, sync_reference_clock DISABLED), "
+                        f"dc_reference_slave={selected_dc_ref}",
+                        stderr=True,
                     )
-                    
-                    if result.returncode == 0:
-                        # Parse hex bytes: "0xXX 0xXX 0xXX ..." format
-                        hex_bytes = [int(x, 16) for x in result.stdout.strip().split()]
-                        if len(hex_bytes) == 8:
-                            slave_dc_time = int.from_bytes(bytes(hex_bytes), 'little')
-                            offset_ms = abs(pi_time_ns - slave_dc_time) / 1_000_000
-                            
-                            # Log to stderr for immediate visibility
-                            print(f"[DC] Pi time:         {pi_time_ns} ns", file=sys.stderr, flush=True)
-                            print(f"[DC] Slave {selected_dc_ref} DC time: {slave_dc_time} ns", file=sys.stderr, flush=True)
-                            print(f"[DC] Initial offset:  {offset_ms:.1f} ms", file=sys.stderr, flush=True)
-                            
-                            if offset_ms > 50:
-                                initial_time_ns = slave_dc_time
-                                print(f"[DC] ✓ Using slave DC time as app_time", file=sys.stderr, flush=True)
-                            else:
-                                print(f"[DC] Offset <50ms, using Pi time", file=sys.stderr, flush=True)
-                        else:
-                            print(f"[DC] Parse error: {result.stdout}", file=sys.stderr, flush=True)
-                    else:
-                        print(f"[DC] ethercat upload failed (rc={result.returncode}): {result.stderr[:100]}", file=sys.stderr, flush=True)
-                        
-                except subprocess.TimeoutExpired:
-                    print(f"[DC] Timeout reading slave DC time", file=sys.stderr, flush=True)
-                except Exception as e:
-                    print(f"[DC] Error: {e}", file=sys.stderr, flush=True)
-            
+                else:
+                    self._emit_process_log(
+                        f"[DC] Master clock mode=S2M (app_time <- monotonic_ns, sync_reference_clock ENABLED), "
+                        f"dc_reference_slave={selected_dc_ref}",
+                        stderr=True,
+                    )
+                self._m2s_logged_mode = True
+
+            # Seed app_time once before activation. For pure M2S we will quickly
+            # overwrite this with the reference clock time once sync datagrams flow.
             try:
-                self.master.set_application_time(initial_time_ns)
+                self.master.set_application_time(int(time.monotonic_ns()))
             except Exception:
                 pass
 
@@ -1043,6 +1495,67 @@ class EtherCATProcess:
                     raise ValueError("comp_counts/n_samples required")
                 die_pos = int(params["die_pos"])
                 shuttle_pos = int(params["shuttle_pos"])
+                
+                use_ruckig = params.get("use_ruckig_velocity_interface", False)
+                ruckig_integrator = None
+                nip_in_integrator = None
+                nip_out_integrator = None
+                nip_in_target_velocity = 0.0
+                nip_out_target_velocity = 0.0
+                
+                if use_ruckig and RUCKIG_AVAILABLE_CORE:
+                    try:
+                        dt_s = float(self.cfg.cycle_time_ms) / 1000.0
+                        max_velocity = float(params.get("max_velocity", 655360.0))
+                        max_acceleration = float(params.get("max_acceleration", 5000000.0))
+                        max_jerk = float(params.get("max_jerk", 20000000.0))
+                        
+                        ruckig_integrator = RuckigVelocityIntegrator(
+                            dt_s=dt_s,
+                            max_velocity=max_velocity,
+                            max_acceleration=max_acceleration,
+                            max_jerk=max_jerk
+                        )
+                        print(f"[RT-INIT] Ruckig velocity interface enabled for die: max_v={max_velocity:.0f}, max_a={max_acceleration:.0f}, max_j={max_jerk:.0f}", flush=True)
+                        
+                        if params.get("enable_nips", False):
+                            line_speed_mps = float(params.get("line_speed_mps", 0.0))
+                            nip_in_counts_per_rev = float(params.get("nip_in_counts_per_rev", 0.0))
+                            nip_out_counts_per_rev = float(params.get("nip_out_counts_per_rev", 0.0))
+                            nip_in_diameter_m = float(params.get("nip_in_roller_diameter_m", 0.1))
+                            nip_out_diameter_m = float(params.get("nip_out_roller_diameter_m", 0.1))
+                            
+                            if line_speed_mps > 0:
+                                nip_in_target_velocity = ContinuousRotationTrajectory.calculate_nip_target_velocity(
+                                    line_speed_mps=line_speed_mps,
+                                    roller_diameter_m=nip_in_diameter_m,
+                                    counts_per_rev=nip_in_counts_per_rev
+                                )
+                                nip_out_target_velocity = ContinuousRotationTrajectory.calculate_nip_target_velocity(
+                                    line_speed_mps=line_speed_mps,
+                                    roller_diameter_m=nip_out_diameter_m,
+                                    counts_per_rev=nip_out_counts_per_rev
+                                )
+                                
+                                nip_in_integrator = RuckigVelocityIntegrator(
+                                    dt_s=dt_s,
+                                    max_velocity=max_velocity,
+                                    max_acceleration=max_acceleration,
+                                    max_jerk=max_jerk
+                                )
+                                nip_out_integrator = RuckigVelocityIntegrator(
+                                    dt_s=dt_s,
+                                    max_velocity=max_velocity,
+                                    max_acceleration=max_acceleration,
+                                    max_jerk=max_jerk
+                                )
+                                print(f"[RT-INIT] Ruckig velocity interface enabled for nips: in_target={nip_in_target_velocity:.0f}, out_target={nip_out_target_velocity:.0f}", flush=True)
+                    except Exception as e:
+                        print(f"[RT-INIT] Ruckig init failed, falling back to linear ramp: {e}", flush=True)
+                        ruckig_integrator = None
+                        nip_in_integrator = None
+                        nip_out_integrator = None
+                
                 self._semi_rotary_rt = {
                     "active": True,
                     "die_pos": die_pos,
@@ -1070,6 +1583,14 @@ class EtherCATProcess:
                     "rev_count_rt": None,
                     "blend_rt": None,
                     "comp_raw_rt": None,
+                    "ruckig_integrator": ruckig_integrator,
+                    "use_ruckig": use_ruckig and ruckig_integrator is not None,
+                    "nip_in_integrator": nip_in_integrator,
+                    "nip_out_integrator": nip_out_integrator,
+                    "nip_in_target_velocity": nip_in_target_velocity if nip_in_integrator is not None else 0.0,
+                    "nip_out_target_velocity": nip_out_target_velocity if nip_out_integrator is not None else 0.0,
+                    "nip_in_actual": int(params.get("nip_in_start") or 0),
+                    "nip_out_actual": int(params.get("nip_out_start") or 0),
                 }
                 self.last_mode_cmd[die_pos] = MODE_CSP
                 self.last_mode_cmd[shuttle_pos] = MODE_CSP
@@ -1089,6 +1610,12 @@ class EtherCATProcess:
                 if "comp_counts" in params and params["comp_counts"]:
                     self._semi_rotary_rt["comp_counts"] = [int(v) for v in params["comp_counts"]]
                     self._semi_rotary_rt["n_samples"] = int(params.get("n_samples") or len(self._semi_rotary_rt["comp_counts"]))
+                if "die_counts_per_rev" in params:
+                    self._semi_rotary_rt["target_counts_per_rev"] = float(params["die_counts_per_rev"])
+                if "die_velocity_counts_per_s" in params:
+                    self._semi_rotary_rt["target_velocity_counts_per_s"] = float(params["die_velocity_counts_per_s"])
+                if "phase_offset" in params:
+                    self._semi_rotary_rt["phase_offset"] = float(params["phase_offset"])
                 for key in (
                     "blend_cycles",
                     "max_shuttle_delta_per_cycle",
@@ -1096,11 +1623,60 @@ class EtherCATProcess:
                     "enable_nips",
                     "nip_in_counts_per_rev",
                     "nip_out_counts_per_rev",
+                    "velocity_ramp_rate",
                 ):
                     if key in params:
                         self._semi_rotary_rt[key] = params[key]
         elif cmd.type == CommandType.STOP_SEMI_ROTARY_RT:
             self._semi_rotary_rt["active"] = False
+        elif cmd.type == CommandType.START_DIE_VELOCITY_TEST:
+            params = dict(cmd.params or {})
+            try:
+                die_pos = int(params["die_pos"])
+                target_rpm = float(params.get("target_rpm", 5.0))
+                counts_per_rev = float(params["die_counts_per_rev"])
+                max_velocity = float(params["max_velocity"])
+                max_acceleration = float(params["max_acceleration"])
+                max_jerk = float(params["max_jerk"])
+                dt_s = float(self.cfg.cycle_time_ms) / 1000.0
+                
+                target_velocity = (target_rpm / 60.0) * counts_per_rev
+                
+                if not RUCKIG_AVAILABLE_CORE:
+                    logger.error("Ruckig not available - cannot start die velocity test")
+                    return
+                
+                current_pos = self._read_pdo_cached(die_pos, POSITION_ACTUAL_INDEX) or 0
+                current_vel = self._read_pdo_cached(die_pos, VELOCITY_ACTUAL_INDEX) or 0
+                
+                self._die_velocity_integrator = RuckigVelocityIntegrator(
+                    dt_s, max_velocity, max_acceleration, max_jerk
+                )
+                self._die_velocity_integrator.reset(
+                    position=float(current_pos),
+                    velocity=float(current_vel),
+                    acceleration=0.0
+                )
+                
+                self._die_test_target_rpm = target_rpm
+                self._die_test_target_velocity = target_velocity
+                self._die_test_pos = die_pos
+                self._die_velocity_test_active = True
+                
+                self.last_mode_cmd[die_pos] = MODE_CSP
+                
+                logger.info(
+                    f"Started die velocity test: pos={die_pos} rpm={target_rpm:.2f} "
+                    f"target_vel={target_velocity:.1f} counts/s current_pos={current_pos}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to start die velocity test: {e}")
+                self._die_velocity_test_active = False
+        elif cmd.type == CommandType.STOP_DIE_VELOCITY_TEST:
+            if self._die_velocity_test_active:
+                logger.info("Stopping die velocity test")
+                self._die_velocity_test_active = False
+                self._die_velocity_integrator = None
         elif cmd.type == CommandType.DISABLE_PROBE:
             # Clear probe function on device (will be applied once in cyclic)
             self.last_probe_arm[cmd.target_id] = 0
@@ -1141,9 +1717,13 @@ class EtherCATProcess:
             index = cmd.params.get("index")
             subindex = cmd.params.get("subindex", 0)
             try:
-                self.master.sdo_download(cmd.target_id, index, subindex, cmd.value)
+                if index is None:
+                    raise ValueError("missing index")
+                if not self._sdo_mgr.has(int(cmd.target_id), int(index), int(subindex)):
+                    raise ValueError("no SDO request object registered for this index/subindex")
+                self._sdo_mgr.set_desired_write(int(cmd.target_id), int(index), int(subindex), bytes(cmd.value))
             except Exception as e:
-                logger.error(f"SDO write failed: slave={cmd.target_id} 0x{index:04X}:{subindex}: {e}")
+                logger.error(f"SDO write schedule failed: slave={cmd.target_id} 0x{int(index or 0):04X}:{int(subindex)}: {e}")
 
     def _auto_enable_drives(self):
         """
@@ -1217,6 +1797,11 @@ class EtherCATProcess:
                 continue  # Move to next slave
             else:
                 self._fault_active_last[slave_pos] = False
+                # Stop any periodic fault-code SDO reads once out of FAULT.
+                try:
+                    self._sdo_mgr.clear_desired_read(slave_pos, ERROR_CODE_INDEX, 0)
+                except Exception:
+                    pass
             
             # Determine current state using CiA 402 standard bit patterns
             state_bits = statusword & 0x006F
@@ -1392,6 +1977,9 @@ class EtherCATProcess:
                 raw = self.master.read_domain(self.domain, entries[(SW_INDEX, 0)], 2) or b"\x00\x00"
                 sw = int.from_bytes(raw, 'little')
                 drive['statusword'] = sw
+                if slave_pos == 3 and self.cycle_count % 500 == 0:
+                    sys.stdout.write(f"[SHM-DEBUG] Slave 3 cycle {self.cycle_count}: statusword offset={entries[(SW_INDEX, 0)]} raw={raw.hex()} value=0x{sw:04X}\n")
+                    sys.stdout.flush()
                 # Derived semantics (no extra bus access)
                 state_bits = sw & 0x006F
                 drive['enabled'] = (state_bits == 0x0027) and not self._manual_disable.get(slave_pos, False)
@@ -1421,26 +2009,34 @@ class EtherCATProcess:
                 drive['torque_actual'] = int.from_bytes(raw, 'little', signed=True)
 
             # Probe status
-            if (PROBE_STATUS_INDEX, 0) in entries:
-                raw = self.master.read_domain(self.domain, entries[(PROBE_STATUS_INDEX, 0)], 2) or b"\x00\x00"
-                drive['probe_active'] = bool(int.from_bytes(raw, 'little') & 0x0001)
-                drive['probe_enabled'] = True
-            if (PROBE_POS1_INDEX, 0) in entries:
-                raw = self.master.read_domain(self.domain, entries[(PROBE_POS1_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
-                drive['probe_pos1'] = int.from_bytes(raw, 'little', signed=True)
-            if (PROBE_POS2_INDEX, 0) in entries:
-                raw = self.master.read_domain(self.domain, entries[(PROBE_POS2_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
-                drive['probe_pos2'] = int.from_bytes(raw, 'little', signed=True)
-            elif (PROBE_POS2_ALT_INDEX, 0) in entries:
-                # Some devices map Probe-2 position at 0x60BB instead of 0x60BC.
-                raw = self.master.read_domain(self.domain, entries[(PROBE_POS2_ALT_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
-                drive['probe_pos2'] = int.from_bytes(raw, 'little', signed=True)
+            try:
+                if (PROBE_STATUS_INDEX, 0) in entries:
+                    raw = self.master.read_domain(self.domain, entries[(PROBE_STATUS_INDEX, 0)], 2) or b"\x00\x00"
+                    drive['probe_active'] = bool(int.from_bytes(raw, 'little') & 0x0001)
+                    drive['probe_enabled'] = True
+                if (PROBE_POS1_INDEX, 0) in entries:
+                    raw = self.master.read_domain(self.domain, entries[(PROBE_POS1_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                    drive['probe_pos1'] = int.from_bytes(raw, 'little', signed=True)
+                if (PROBE_POS2_INDEX, 0) in entries:
+                    raw = self.master.read_domain(self.domain, entries[(PROBE_POS2_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                    drive['probe_pos2'] = int.from_bytes(raw, 'little', signed=True)
+                elif (PROBE_POS2_ALT_INDEX, 0) in entries:
+                    raw = self.master.read_domain(self.domain, entries[(PROBE_POS2_ALT_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                    drive['probe_pos2'] = int.from_bytes(raw, 'little', signed=True)
+            except Exception as e:
+                if slave_pos == 3:
+                    sys.stdout.write(f"[ERROR] Slave 3 probe read exception: {e}\n")
+                    sys.stdout.flush()
             if (DIGITAL_INPUTS_INDEX, 0) in entries:
                 raw = self.master.read_domain(self.domain, entries[(DIGITAL_INPUTS_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
                 drive['digital_inputs'] = int.from_bytes(raw, 'little')
             if (DIP_IN_STATE_INDEX, 1) in entries:
                 raw = self.master.read_domain(self.domain, entries[(DIP_IN_STATE_INDEX, 1)], 4) or b"\x00\x00\x00\x00"
                 drive['dip_in_state'] = int.from_bytes(raw, 'little')
+            elif slave_pos == 3 and self.cycle_count < 5:
+                sys.stdout.write(f"[PROC-DEBUG] Slave 3 cycle {self.cycle_count}: DIP_IN_STATE_INDEX={(DIP_IN_STATE_INDEX, 1)} NOT in entries!\n")
+                sys.stdout.write(f"[PROC-DEBUG] entries keys: {list(entries.keys())}\n")
+                sys.stdout.flush()
             if (ERROR_CODE_INDEX, 0) in entries:
                 raw = self.master.read_domain(self.domain, entries[(ERROR_CODE_INDEX, 0)], 2) or b"\x00\x00"
                 drive['error_code'] = int.from_bytes(raw, 'little')
@@ -1475,6 +2071,13 @@ class EtherCATProcess:
                     state = 'pdo'
                 pdo_health[f"0x{key_idx:04X}:0"] = state
             drive['pdo_health'] = pdo_health
+            if slave_pos == 3 and self.cycle_count in [15000, 15001, 15002]:
+                sys.stdout.write(f"[PROC-DEBUG2] Slave 3 cycle {self.cycle_count}: About to publish drive dict keys: {list(drive.keys())}\n")
+                if 'dip_in_state' in drive:
+                    sys.stdout.write(f"[PROC-DEBUG2] Slave 3: dip_in_state=0x{drive['dip_in_state']:08X}\n")
+                else:
+                    sys.stdout.write(f"[PROC-DEBUG2] Slave 3: dip_in_state NOT in drive dict!\n")
+                sys.stdout.flush()
             status.drives[slave_pos] = drive
         try:
             self.status_q.put_nowait(status)
@@ -1522,14 +2125,16 @@ class EtherCATProcess:
                 if (MODES_OP_INDEX, 0) in entries:
                     self.master.write_domain(self.domain, entries[(MODES_OP_INDEX, 0)], bytes([mode]))
                 else:
-                    prev_sdo_mode = self._last_mode_sdo.get(slave_pos)
-                    if mode != prev_sdo_mode:
-                        logger.warning(f"Slave {slave_pos}: {hex(MODES_OP_INDEX)} not in PDO; writing mode={mode} via SDO")
-                        try:
-                            self.master.sdo_download(slave_pos, MODES_OP_INDEX, 0, bytes([mode]))
-                            self._last_mode_sdo[slave_pos] = mode
-                        except Exception as e:
-                            logger.error(f"SDO write {hex(MODES_OP_INDEX)} failed: {e}")
+                    prev = self._last_mode_sdo.get(slave_pos)
+                    if mode != prev:
+                        logger.warning(
+                            f"Slave {slave_pos}: {hex(MODES_OP_INDEX)} not in PDO; scheduling mode={mode} via SDO request object"
+                        )
+                        self._last_mode_sdo[slave_pos] = mode
+                        if self._sdo_mgr.has(slave_pos, MODES_OP_INDEX, 0):
+                            self._sdo_mgr.set_desired_write(slave_pos, MODES_OP_INDEX, 0, bytes([int(mode) & 0xFF]))
+                        else:
+                            logger.error(f"Slave {slave_pos}: no SDO request object for {hex(MODES_OP_INDEX)}:0")
 
             motion_ok = self.drive_enabled.get(slave_pos, False) and not self._manual_disable.get(slave_pos, False)
             mode_eff = mode if mode is not None else self._default_mode.get(slave_pos)
@@ -1544,21 +2149,21 @@ class EtherCATProcess:
                     if (TARGET_VELOCITY_INDEX, 0) in entries:
                         self.master.write_domain(self.domain, entries[(TARGET_VELOCITY_INDEX, 0)], v.to_bytes(4, byteorder='little', signed=True))
                     else:
-                        prev_sdo_vel = self._last_velocity_sdo.get(slave_pos)
-                        if v != prev_sdo_vel:
-                            logger.info(f"Slave {slave_pos}: {hex(TARGET_VELOCITY_INDEX)} not in PDO; writing vel={v} via async SDO")
-                            self._last_velocity_sdo[slave_pos] = v
-                            
-                            def vel_callback(success, error):
-                                if error is not None:
-                                    logger.error(f"[SDO async] Velocity write failed for slave {slave_pos}: {error}")
-                            
-                            timeout_s = float(getattr(self.cfg, "sdo_timeout_s", 2.0))
-                            self.master.sdo_download_async(
-                                slave_pos, TARGET_VELOCITY_INDEX, 0,
-                                v.to_bytes(4, 'little', signed=True),
-                                timeout_s=timeout_s, callback=vel_callback
+                        prev = self._last_velocity_sdo.get(slave_pos)
+                        if v != prev:
+                            logger.info(
+                                f"Slave {slave_pos}: {hex(TARGET_VELOCITY_INDEX)} not in PDO; scheduling vel={v} via SDO request object"
                             )
+                            self._last_velocity_sdo[slave_pos] = v
+                            if self._sdo_mgr.has(slave_pos, TARGET_VELOCITY_INDEX, 0):
+                                self._sdo_mgr.set_desired_write(
+                                    slave_pos,
+                                    TARGET_VELOCITY_INDEX,
+                                    0,
+                                    v.to_bytes(4, 'little', signed=True),
+                                )
+                            else:
+                                logger.error(f"Slave {slave_pos}: no SDO request object for {hex(TARGET_VELOCITY_INDEX)}:0")
                     if mode_eff != MODE_PT and self._pv_pulse_pending.get(slave_pos, False) and self._pv_pulse_active.get(slave_pos, False):
                         self._pv_pulse_pending[slave_pos] = False
 
@@ -1568,21 +2173,21 @@ class EtherCATProcess:
                 if (TARGET_TORQUE_INDEX, 0) in entries:
                     self.master.write_domain(self.domain, entries[(TARGET_TORQUE_INDEX, 0)], t.to_bytes(2, byteorder='little', signed=True))
                 else:
-                    prev_sdo_torque = self._last_torque_sdo.get(slave_pos)
-                    if t != prev_sdo_torque:
-                        logger.info(f"Slave {slave_pos}: {hex(TARGET_TORQUE_INDEX)} not in PDO; writing torque={t} via async SDO")
-                        self._last_torque_sdo[slave_pos] = t
-                        
-                        def torque_callback(success, error):
-                            if error is not None:
-                                logger.error(f"[SDO async] Torque write failed for slave {slave_pos}: {error}")
-                        
-                        timeout_s = float(getattr(self.cfg, "sdo_timeout_s", 2.0))
-                        self.master.sdo_download_async(
-                            slave_pos, TARGET_TORQUE_INDEX, 0,
-                            t.to_bytes(2, 'little', signed=True),
-                            timeout_s=timeout_s, callback=torque_callback
+                    prev = self._last_torque_sdo.get(slave_pos)
+                    if t != prev:
+                        logger.info(
+                            f"Slave {slave_pos}: {hex(TARGET_TORQUE_INDEX)} not in PDO; scheduling torque={t} via SDO request object"
                         )
+                        self._last_torque_sdo[slave_pos] = t
+                        if self._sdo_mgr.has(slave_pos, TARGET_TORQUE_INDEX, 0):
+                            self._sdo_mgr.set_desired_write(
+                                slave_pos,
+                                TARGET_TORQUE_INDEX,
+                                0,
+                                t.to_bytes(2, 'little', signed=True),
+                            )
+                        else:
+                            logger.error(f"Slave {slave_pos}: no SDO request object for {hex(TARGET_TORQUE_INDEX)}:0")
 
             # Maintain target position (0x607A)
             # - PP/HM: write the last commanded target (latch with bit4 pulse below)
@@ -1607,22 +2212,25 @@ class EtherCATProcess:
                 if (TARGET_POSITION_INDEX, 0) in entries:
                     self.master.write_domain(self.domain, entries[(TARGET_POSITION_INDEX, 0)], p.to_bytes(4, byteorder='little', signed=True))
                 else:
-                    sdo_done = self.warned_missing_pdo.setdefault(slave_pos, set())
+                    warned = self.warned_missing_pdo.setdefault(slave_pos, set())
                     key = (TARGET_POSITION_INDEX, 0)
-                    if key not in sdo_done:
-                        logger.warning(f"Slave {slave_pos}: {hex(TARGET_POSITION_INDEX)} not in PDO; writing via async SDO (once)")
-                        sdo_done.add(key)
-                        
-                        def pos_callback(success, error):
-                            if error is not None:
-                                logger.error(f"[SDO async] Position write failed for slave {slave_pos}: {error}")
-                        
-                        timeout_s = float(getattr(self.cfg, "sdo_timeout_s", 2.0))
-                        self.master.sdo_download_async(
-                            slave_pos, TARGET_POSITION_INDEX, 0,
-                            p.to_bytes(4, 'little', signed=True),
-                            timeout_s=timeout_s, callback=pos_callback
+                    if key not in warned:
+                        logger.warning(
+                            f"Slave {slave_pos}: {hex(TARGET_POSITION_INDEX)} not in PDO; scheduling via SDO request object"
                         )
+                        warned.add(key)
+                    prev = self._last_position_sdo.get(slave_pos)
+                    if p != prev:
+                        self._last_position_sdo[slave_pos] = p
+                        if self._sdo_mgr.has(slave_pos, TARGET_POSITION_INDEX, 0):
+                            self._sdo_mgr.set_desired_write(
+                                slave_pos,
+                                TARGET_POSITION_INDEX,
+                                0,
+                                p.to_bytes(4, "little", signed=True),
+                            )
+                        else:
+                            logger.error(f"Slave {slave_pos}: no SDO request object for {hex(TARGET_POSITION_INDEX)}:0")
 
             # Controlword bit maintenance (0x6040):
             # Build controlword from desired state machine value + motion bits
@@ -1730,21 +2338,49 @@ class EtherCATProcess:
                     warned = self.warned_missing_pdo.setdefault(slave_pos, set())
                     key = (PROBE_FUNCTION_INDEX, 0)
                     if key not in warned:
-                        logger.warning(f"Slave {slave_pos}: {hex(PROBE_FUNCTION_INDEX)} not in PDO; writing via async SDO")
+                        logger.warning(
+                            f"Slave {slave_pos}: {hex(PROBE_FUNCTION_INDEX)} not in PDO; scheduling via SDO request object"
+                        )
                         warned.add(key)
-                    
-                    def probe_callback(success, error):
-                        if error is not None:
-                            logger.error(f"[SDO async] Probe write failed for slave {slave_pos}: {error}")
-                    
-                    timeout_s = float(getattr(self.cfg, "sdo_timeout_s", 2.0))
-                    self.master.sdo_download_async(
-                        slave_pos, PROBE_FUNCTION_INDEX, 0,
-                        probe_val.to_bytes(2, 'little'),
-                        timeout_s=timeout_s, callback=probe_callback
-                    )
+                    if self._sdo_mgr.has(slave_pos, PROBE_FUNCTION_INDEX, 0):
+                        self._sdo_mgr.set_desired_write(
+                            slave_pos,
+                            PROBE_FUNCTION_INDEX,
+                            0,
+                            int(probe_val).to_bytes(2, "little"),
+                        )
+                    else:
+                        logger.error(f"Slave {slave_pos}: no SDO request object for {hex(PROBE_FUNCTION_INDEX)}:0")
                     self.last_probe_arm[slave_pos] = None
 
+    def _update_die_velocity_test(self) -> None:
+        """
+        RT update for die velocity test mode using Ruckig velocity interface.
+        Generates smooth CSP position setpoints from velocity profile.
+        """
+        if not self._die_velocity_test_active or self._die_velocity_integrator is None:
+            return
+        
+        if self.cfg.sdo_only or self.domain is None:
+            return
+        
+        die_pos = self._die_test_pos
+        if die_pos is None:
+            return
+        
+        if not self.drive_enabled.get(die_pos, False) or self._manual_disable.get(die_pos, False):
+            return
+        
+        try:
+            position, velocity, acceleration = self._die_velocity_integrator.step(
+                self._die_test_target_velocity
+            )
+            
+            self._csp_target_next[die_pos] = int(round(position))
+        except Exception as e:
+            logger.error(f"Die velocity test update failed: {e}")
+            self._die_velocity_test_active = False
+    
     def _update_semi_rotary_rt(self) -> None:
         rt = self._semi_rotary_rt
         if not rt.get("active"):
@@ -1774,9 +2410,77 @@ class EtherCATProcess:
         if not raw:
             return
         die_actual = int.from_bytes(raw, "little", signed=True)
-        die_elapsed = die_actual - int(rt.get("die_start", 0))
+        
         counts_per_rev = float(rt.get("die_counts_per_rev", 0.0))
         abs_counts_per_rev = abs(counts_per_rev)
+        if abs_counts_per_rev <= 0.0:
+            rt["error"] = "die_counts_per_rev must be non-zero"
+            rt["active"] = False
+            return
+        
+        cycle_count = int(rt.get("cycle_count", 0))
+        die_start = int(rt.get("die_start", 0))
+        
+        use_ruckig = rt.get("use_ruckig", False)
+        ruckig_integrator = rt.get("ruckig_integrator")
+        target_velocity_counts_per_s = float(rt.get("die_velocity_counts_per_s", 0.0))
+        
+        if cycle_count == 0:
+            rt["die_commanded_position"] = die_actual
+            rt["target_counts_per_rev"] = counts_per_rev
+            rt["die_velocity_counts_per_s"] = target_velocity_counts_per_s
+            rt["target_velocity_counts_per_s"] = target_velocity_counts_per_s
+            
+            if use_ruckig and ruckig_integrator is not None:
+                ruckig_integrator.reset(position=0.0, velocity=0.0, acceleration=0.0)
+                print(f"[RT-INIT] Using Ruckig velocity interface, target_velocity={target_velocity_counts_per_s:.0f} counts/s", flush=True)
+            else:
+                rt["die_velocity_counts_per_s"] = 0.0
+                print(f"[RT-INIT] Using linear ramp, target_velocity={target_velocity_counts_per_s:.0f} counts/s", flush=True)
+            
+            print(f"[RT-INIT] die_actual={die_actual}, die_commanded_position={die_actual}", flush=True)
+        
+        die_commanded = rt.get("die_commanded_position", die_actual)
+        dt_s = float(self.cfg.cycle_time_ms) / 1000.0
+        
+        if use_ruckig and ruckig_integrator is not None:
+            position, velocity, acceleration = ruckig_integrator.step(target_velocity_counts_per_s)
+            die_commanded = int(die_actual + position)
+            
+            if cycle_count % 500 == 0:
+                print(f"[RT-RUCKIG] cycle={cycle_count}, target_vel={target_velocity_counts_per_s:.1f}, "
+                      f"current_vel={velocity:.1f}, acc={acceleration:.1f}, commanded={die_commanded}", flush=True)
+        else:
+            die_velocity_counts_per_s = rt.get("die_velocity_counts_per_s", 0.0)
+            
+            if abs(target_velocity_counts_per_s - die_velocity_counts_per_s) > 0.01:
+                ramp_rate = float(rt.get("velocity_ramp_rate", 100000.0))
+                max_change_per_cycle = ramp_rate * dt_s
+                delta = target_velocity_counts_per_s - die_velocity_counts_per_s
+                if abs(delta) <= max_change_per_cycle:
+                    die_velocity_counts_per_s = target_velocity_counts_per_s
+                else:
+                    die_velocity_counts_per_s += max_change_per_cycle if delta > 0 else -max_change_per_cycle
+                rt["die_velocity_counts_per_s"] = die_velocity_counts_per_s
+            
+            die_velocity_counts_per_cycle = die_velocity_counts_per_s * dt_s
+            die_commanded = int(die_commanded + die_velocity_counts_per_cycle)
+            
+            if cycle_count % 500 == 0:
+                print(f"[RT-LINEAR] cycle={cycle_count}, vel/s={die_velocity_counts_per_s:.1f}, "
+                      f"vel/cyc={die_velocity_counts_per_cycle:.3f}, commanded={die_commanded}", flush=True)
+        
+        self._csp_target_next[die_pos] = int(die_commanded)
+        self.last_mode_cmd[die_pos] = MODE_CSP
+        rt["die_commanded_position"] = die_commanded
+        
+        if cycle_count % 500 == 0:
+            print(f"[RT-SEND] pos={die_pos}, csp_target={int(die_commanded)}", flush=True)
+            actual_die_pos = self.position_actual.get(die_pos, 0)
+            error = actual_die_pos - die_commanded
+            print(f"[RT-FEEDBACK] cmd={die_commanded}, actual={actual_die_pos}, error={error}", flush=True)
+        
+        die_elapsed = die_actual - die_start
         if abs_counts_per_rev <= 0.0:
             rt["error"] = "die_counts_per_rev must be non-zero"
             rt["active"] = False
@@ -1786,6 +2490,9 @@ class EtherCATProcess:
             die_phase = ((-die_elapsed) % abs_counts_per_rev) / abs_counts_per_rev
         else:
             die_phase = (die_elapsed % abs_counts_per_rev) / abs_counts_per_rev
+        
+        phase_offset = float(rt.get("phase_offset", 0.0))
+        die_phase = (die_phase + phase_offset) % 1.0
 
         comp_counts = rt.get("comp_counts") or []
         n_samples = int(rt.get("n_samples") or len(comp_counts))
@@ -1842,13 +2549,32 @@ class EtherCATProcess:
 
         if bool(rt.get("enable_nips", False)):
             nip_in_pos = rt.get("nip_in_pos")
+            nip_in_integrator = rt.get("nip_in_integrator")
+            nip_in_target_velocity = rt.get("nip_in_target_velocity", 0.0)
+            
             if nip_in_pos is not None and self.drive_enabled.get(nip_in_pos, False) and not self._manual_disable.get(nip_in_pos, False):
-                nip_in_target = int(rt.get("nip_in_start", 0)) + int(rev_count * float(rt.get("nip_in_counts_per_rev", 0.0)))
+                if nip_in_integrator is not None and rt.get("use_ruckig", False):
+                    nip_in_position, nip_in_velocity, nip_in_acceleration = nip_in_integrator.step(nip_in_target_velocity)
+                    nip_in_actual = int(rt.get("nip_in_actual", rt.get("nip_in_start", 0)))
+                    nip_in_target = nip_in_actual + int(nip_in_position)
+                    rt["nip_in_actual"] = int(nip_in_target)
+                else:
+                    nip_in_target = int(rt.get("nip_in_start", 0)) + int(rev_count * float(rt.get("nip_in_counts_per_rev", 0.0)))
                 self._csp_target_next[int(nip_in_pos)] = int(nip_in_target)
                 self.last_mode_cmd[int(nip_in_pos)] = MODE_CSP
+            
             nip_out_pos = rt.get("nip_out_pos")
+            nip_out_integrator = rt.get("nip_out_integrator")
+            nip_out_target_velocity = rt.get("nip_out_target_velocity", 0.0)
+            
             if nip_out_pos is not None and self.drive_enabled.get(nip_out_pos, False) and not self._manual_disable.get(nip_out_pos, False):
-                nip_out_target = int(rt.get("nip_out_start", 0)) + int(rev_count * float(rt.get("nip_out_counts_per_rev", 0.0)))
+                if nip_out_integrator is not None and rt.get("use_ruckig", False):
+                    nip_out_position, nip_out_velocity, nip_out_acceleration = nip_out_integrator.step(nip_out_target_velocity)
+                    nip_out_actual = int(rt.get("nip_out_actual", rt.get("nip_out_start", 0)))
+                    nip_out_target = nip_out_actual + int(nip_out_position)
+                    rt["nip_out_actual"] = int(nip_out_target)
+                else:
+                    nip_out_target = int(rt.get("nip_out_start", 0)) + int(rev_count * float(rt.get("nip_out_counts_per_rev", 0.0)))
                 self._csp_target_next[int(nip_out_pos)] = int(nip_out_target)
                 self.last_mode_cmd[int(nip_out_pos)] = MODE_CSP
 
@@ -2153,6 +2879,7 @@ class EtherCATProcess:
                         f"avg:jitter={self._log_jitter_sum // _n} "
                         f"max:lateness={self._log_lateness_max} "
                         f"max:work={self._log_work_max} "
+                        f"min:sleep_win={self._min_sleep_budget_window_ns} "
                         f"min:sleep={self._min_sleep_budget_ns} "
                         f"overruns={self._overrun_count} "
                         f"max:recv={self._phase_recv_max} "
@@ -2161,6 +2888,7 @@ class EtherCATProcess:
                         f"max:ruckig={self._phase_ruckig_max} "
                         f"max:pdo_w={self._phase_write_max} "
                         f"max:dc_send={self._phase_dc_send_max} "
+                        f"max:tail={self._phase_tail_max} "
                         f"dc_err={self._last_dc_sync_error_ns} "
                         f"cycles={_n}"
                     )
@@ -2175,6 +2903,8 @@ class EtherCATProcess:
                     self._phase_ruckig_max = 0
                     self._phase_write_max = 0
                     self._phase_dc_send_max = 0
+                    self._phase_tail_max = 0
+                    self._min_sleep_budget_window_ns = None
                     last_timing_log_mono = cycle_start_mono
                 self.cycle_count += 1
                 next_cycle_mono += cycle_ns
@@ -2191,6 +2921,85 @@ class EtherCATProcess:
                     self.master.receive()
                     self.master.process_domain(self.domain)
                     _t_recv = time.monotonic_ns()
+
+                    # Poll SDO request objects after receive/process so completions are observed.
+                    try:
+                        self._sdo_mgr.poll(int(self.cycle_count))
+                    except Exception:
+                        pass
+
+                    if self._dc_master_sync_mode == "m2s":
+                        # Pure M2S: discipline application_time from the reference slave DC clock.
+                        # The 32-bit ref time is only valid after a prior sync_slave_clocks() datagram
+                        # has been received, so we gracefully fall back until then.
+                        ref32 = None
+                        try:
+                            ref32 = self.master.reference_clock_time_32()
+                        except Exception:
+                            ref32 = None
+                        if ref32 is not None:
+                            if self._m2s_last_app_time_ns is None:
+                                self._m2s_last_app_time_ns = int(time.monotonic_ns())
+
+                            if getattr(self._m2s_ref_ext, "_last32", None) is None:
+                                self._m2s_ref_time_ns = int(self._m2s_ref_ext.seed_near(self._m2s_last_app_time_ns, int(ref32)))
+                            else:
+                                self._m2s_ref_time_ns = int(self._m2s_ref_ext.update(int(ref32)))
+
+                            if not self._m2s_logged_lock:
+                                self._emit_process_log(
+                                    f"[DC] M2S locked: ref32=0x{int(ref32) & 0xFFFF_FFFF:08X} "
+                                    f"ref_time_ns={int(self._m2s_ref_time_ns)} app_time_ns={int(self._m2s_last_app_time_ns)}",
+                                    stderr=True,
+                                )
+                                self._m2s_logged_lock = True
+
+                            if not self._m2s_logged_pll:
+                                self._emit_process_log(
+                                    f"[DC] M2S PLL: k={self._m2s_k:g} window={getattr(self._m2s_phase_err_window, 'maxlen', None)} "
+                                    f"max_corr_ns={self._m2s_max_correction_ns}",
+                                    stderr=True,
+                                )
+                                self._m2s_logged_pll = True
+
+                            # Predict next app_time by nominal cycle, then apply a bounded correction toward ref_time.
+                            prev_app = int(self._m2s_last_app_time_ns)
+                            predicted = prev_app + int(cycle_ns)
+                            phase_err = int(self._m2s_ref_time_ns) - int(predicted)
+                            self._m2s_phase_err_window.append(phase_err)
+                            filt_err = _median_i64(list(self._m2s_phase_err_window))
+                            corr = int(self._m2s_k * float(filt_err))
+                            if corr > self._m2s_max_correction_ns:
+                                corr = self._m2s_max_correction_ns
+                            elif corr < -self._m2s_max_correction_ns:
+                                corr = -self._m2s_max_correction_ns
+
+                            new_app = predicted + corr
+                            if new_app <= prev_app:
+                                new_app = prev_app + 1
+                            self._m2s_last_app_time_ns = int(new_app)
+                        else:
+                            if self._m2s_last_app_time_ns is None:
+                                self._m2s_last_app_time_ns = int(time.monotonic_ns())
+                            else:
+                                self._m2s_last_app_time_ns += int(cycle_ns)
+                            if not self._m2s_logged_fallback:
+                                self._emit_process_log(
+                                    "[DC] M2S waiting for reference clock time (fallback app_time active)",
+                                    stderr=True,
+                                )
+                                self._m2s_logged_fallback = True
+                        try:
+                            self.master.set_application_time(int(self._m2s_last_app_time_ns))
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            # Use monotonic time for application_time to avoid wall-clock jumps (NTP/RTC adjustments)
+                            # destabilizing DC sync and triggering AL 0x001A sync errors.
+                            self.master.set_application_time(time.monotonic_ns())
+                        except Exception:
+                            pass
 
                     wc, wc_state = self.master.domain_state(self.domain)
                     self._last_domain_wc = wc
@@ -2284,23 +3093,25 @@ class EtherCATProcess:
                                     self._emit_process_log("[EC] OP timeout condition cleared; all slaves back in OP")
                                 self._op_timeout_active = False
 
-                    _t_state = time.monotonic_ns()
-                    self._auto_enable_drives()
-                    _t_cia = time.monotonic_ns()
-                    self._update_ruckig()
+                _t_state = time.monotonic_ns()
+                self._auto_enable_drives()
+                _t_cia = time.monotonic_ns()
+                self._update_ruckig()
+                if self._die_velocity_test_active:
+                    self._update_die_velocity_test()
+                else:
                     self._update_semi_rotary_rt()
-                    _t_ruckig = time.monotonic_ns()
-                    self._read_targets_from_shm()
-                    self._cyclic_write()
-                    _t_write = time.monotonic_ns()
+                _t_ruckig = time.monotonic_ns()
+                self._read_targets_from_shm()
+                self._cyclic_write()
+                _t_write = time.monotonic_ns()
 
-                    try:
-                        self.master.set_application_time(time.time_ns())
-                    except Exception:
-                        pass
+                if self._dc_master_sync_mode == "m2s":
+                    self.master.sync_slave_clocks()
+                else:
                     self.master.sync_reference_clock()
                     self.master.sync_slave_clocks()
-                    # DC sync monitor: MUST run every cycle for proper clock adjustment
+                    # DC sync monitor: process last result, then queue next cycle's monitor datagram.
                     try:
                         dc_err_ns = self.master.sync_monitor_process()
                         if dc_err_ns is not None:
@@ -2311,6 +3122,16 @@ class EtherCATProcess:
                             if abs_dc > self._max_abs_dc_sync_error_ns:
                                 self._max_abs_dc_sync_error_ns = abs_dc
                         self.master.sync_monitor_queue()
+                    except Exception:
+                        pass
+
+                    # Queue any due SDO request-object operations before sending datagrams.
+                    try:
+                        if self._sdo_queue_allowed_now():
+                            self._sdo_mgr.queue_due(int(self.cycle_count))
+                        else:
+                            # Prevent backlog / repeated queue attempts during unhealthy OP/WC/DC windows.
+                            self._sdo_mgr.clear_all_desired()
                     except Exception:
                         pass
 
@@ -2352,6 +3173,9 @@ class EtherCATProcess:
                 sleep_ns = next_cycle_mono - time.monotonic_ns()
                 if self._min_sleep_budget_ns is None or sleep_ns < self._min_sleep_budget_ns:
                     self._min_sleep_budget_ns = sleep_ns
+                # Windowed min sleep budget for timing logs (reset after each timing log emission).
+                if self._min_sleep_budget_window_ns is None or sleep_ns < self._min_sleep_budget_window_ns:
+                    self._min_sleep_budget_window_ns = sleep_ns
                 if sleep_ns <= 0:
                     self._overrun_count += 1
                     overrun_magnitude = abs(sleep_ns)
@@ -2577,6 +3401,8 @@ class EtherCATProcessManager:
             drive['torque_actual'] = int(shm[base + SHM.DRIVE_TORQUE])
             drive['mode_display'] = int(shm[base + SHM.DRIVE_MODE])
             drive['error_code'] = int(shm[base + SHM.DRIVE_ERROR_CODE])
+            drive['digital_inputs'] = int(shm[base + SHM.DRIVE_DIGITAL_INPUTS])
+            drive['dip_in_state'] = int(shm[base + SHM.DRIVE_DIP_IN_STATE])
             sw = drive['statusword']
             state_bits = sw & 0x006F
             drive['fault'] = bool(sw & 0x0008)
