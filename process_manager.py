@@ -1635,12 +1635,13 @@ class EtherCATProcess:
                 die_pos = int(params["die_pos"])
                 target_rpm = float(params.get("target_rpm", 5.0))
                 counts_per_rev = float(params["die_counts_per_rev"])
+                direction = float(params.get("die_direction", 1.0))
                 max_velocity = float(params["max_velocity"])
                 max_acceleration = float(params["max_acceleration"])
                 max_jerk = float(params["max_jerk"])
                 dt_s = float(self.cfg.cycle_time_ms) / 1000.0
                 
-                target_velocity = -1.0 * (target_rpm / 60.0) * counts_per_rev
+                target_velocity = direction * (target_rpm / 60.0) * counts_per_rev
                 
                 if not RUCKIG_AVAILABLE_CORE:
                     logger.error("Ruckig not available - cannot start die velocity test")
