@@ -116,6 +116,7 @@ class RuckigCspPlanner:
         cfg: RuckigConfig,
         dt_s_fallback: float,
         overrides: Optional[Dict[str, Optional[float]]] = None,
+        actual_acceleration: float = 0.0,
     ) -> None:
         self._require()
         self._last_error.pop(slave_pos, None)
@@ -128,7 +129,7 @@ class RuckigCspPlanner:
 
         inp.current_position = [float(actual_position)]
         inp.current_velocity = [float(actual_velocity)]
-        inp.current_acceleration = [0.0]
+        inp.current_acceleration = [float(actual_acceleration)]
         inp.target_position = [float(target_position)]
         inp.target_velocity = [0.0]
         inp.target_acceleration = [0.0]
@@ -159,11 +160,11 @@ class RuckigCspPlanner:
         cfg: RuckigConfig,
         dt_s_fallback: float,
         overrides: Optional[Dict[str, Optional[float]]] = None,
+        actual_acceleration: float = 0.0,
     ) -> None:
         self._require()
         self._last_error.pop(slave_pos, None)
         dt = self._dt_s(cfg, dt_s_fallback)
-        # Velocity mode uses v/a/j limits; max_velocity isn't required to be set, but we will use it if provided.
         max_v, max_a, max_j = self._limits(cfg, overrides or {})
         lookahead = float(cfg.velocity_lookahead_s)
         if lookahead <= 0:
@@ -173,17 +174,17 @@ class RuckigCspPlanner:
         inp = self._InputParameter(1)
         out = self._OutputParameter(1)
 
+        if hasattr(self._ruckig, "ControlInterface"):
+            inp.control_interface = self._ruckig.ControlInterface.Velocity
+
         inp.current_position = [float(actual_position)]
         inp.current_velocity = [float(actual_velocity)]
-        inp.current_acceleration = [0.0]
+        inp.current_acceleration = [float(actual_acceleration)]
         inp.target_velocity = [float(target_velocity)]
         inp.target_acceleration = [0.0]
         inp.max_velocity = [float(max_v)]
         inp.max_acceleration = [float(max_a)]
         inp.max_jerk = [float(max_j)]
-
-        # Initial moving target position to allow reaching/holding desired velocity
-        inp.target_position = [float(actual_position + (target_velocity * lookahead))]
 
         self._state[slave_pos] = {
             "mode": "velocity",
@@ -224,19 +225,15 @@ class RuckigCspPlanner:
 
             if s.get("mode") == "velocity":
                 tv = float(s.get("target_velocity") or 0.0)
-                lookahead = float(s.get("lookahead_s") or 0.5)
                 cur_pos = float(inp.current_position[0])
 
                 if abs(cur_pos) > 1_000_000_000:
                     shift = int(round(cur_pos))
                     inp.current_position = [cur_pos - shift]
-                    inp.target_position = [float(inp.target_position[0]) - shift]
                     s["position_offset"] = s.get("position_offset", 0) + shift
-                    cur_pos = float(inp.current_position[0])
 
                 inp.target_velocity = [tv]
                 inp.target_acceleration = [0.0]
-                inp.target_position = [cur_pos + (tv * lookahead)]
 
             try:
                 res = otg.update(inp, out)
@@ -245,15 +242,9 @@ class RuckigCspPlanner:
                     raise
                 s["velocity_recovery_attempted"] = True
                 tv = float(s.get("target_velocity") or 0.0)
-                lookahead = min(float(s.get("lookahead_s") or 0.5), 0.5)
-                if lookahead <= 0:
-                    lookahead = 0.1
-                cur_pos = float(inp.current_position[0])
                 inp.current_acceleration = [0.0]
                 inp.target_velocity = [tv]
                 inp.target_acceleration = [0.0]
-                inp.target_position = [cur_pos + (tv * lookahead)]
-                s["lookahead_s"] = lookahead
                 res = otg.update(inp, out)
             done = self._is_finished(res)
 

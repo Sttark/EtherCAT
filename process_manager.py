@@ -57,6 +57,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+VELOCITY_DEADBAND_COUNTS_PER_S = 30000.0
+ACCELERATION_DEADBAND_COUNTS_PER_S2 = 100000.0
+
 AL_STATE_SAFEOP = 0x04
 AL_STATE_OP = 0x08
 _SM_WD_DEFAULT_DIVIDER_40NS = 2500  # 2500 * 40ns = 100us base interval
@@ -730,6 +733,7 @@ class EtherCATProcess:
         self._ruckig_trace: Dict[int, Dict[str, Any]] = {}
         self._ruckig_prev_actual_position: Dict[int, int] = {}
         self._ruckig_prev_sample_cycle: Dict[int, int] = {}
+        self._ruckig_prev_velocity: Dict[int, float] = {}
         self._semi_rotary_rt: Dict[str, Any] = {
             "active": False,
             "die_pos": None,
@@ -1599,6 +1603,7 @@ class EtherCATProcess:
                     "nip_out_target_velocity": nip_out_target_velocity if nip_out_integrator is not None else 0.0,
                     "nip_in_actual": int(params.get("nip_in_start") or 0),
                     "nip_out_actual": int(params.get("nip_out_start") or 0),
+                    "active": True,
                 }
                 self.last_mode_cmd[die_pos] = MODE_CSP
                 self.last_mode_cmd[shuttle_pos] = MODE_CSP
@@ -2658,10 +2663,19 @@ class EtherCATProcess:
                 if measured_delta is not None and sample_is_fresh
                 else actual_velocity_drive
             )
+            prev_velocity = self._ruckig_prev_velocity.get(pos)
+            velocity_delta = None if prev_velocity is None else (actual_velocity_estimated - prev_velocity)
+            self._ruckig_prev_velocity[pos] = actual_velocity_estimated
+            actual_acceleration_estimated = (
+                float(velocity_delta) / dt_s_fallback
+                if velocity_delta is not None and sample_is_fresh
+                else 0.0
+            )
             trace = self._ruckig_trace.setdefault(pos, {})
             trace["measured_position_actual"] = int(actual_position)
             trace["measured_velocity_actual"] = float(actual_velocity_drive)
             trace["measured_velocity_estimated"] = float(actual_velocity_estimated)
+            trace["measured_acceleration_estimated"] = float(actual_acceleration_estimated)
             trace["measured_velocity_estimate_fresh"] = bool(sample_is_fresh)
             trace["measured_position_delta"] = measured_delta
             trace["cycle_time_s"] = dt_s_fallback
@@ -2692,6 +2706,10 @@ class EtherCATProcess:
                     "max_jerk": params.get("max_jerk"),
                 }
 
+                velocity_for_init = actual_velocity_estimated
+                velocity_drive_for_init = actual_velocity_drive
+                acceleration_for_init = actual_acceleration_estimated
+
                 try:
                     if req.get("kind") == "position":
                         trace["request_kind"] = "position"
@@ -2699,11 +2717,12 @@ class EtherCATProcess:
                         self._ruckig_planner.start_position(
                             pos,
                             actual_position=actual_position,
-                            actual_velocity=actual_velocity_drive,
+                            actual_velocity=velocity_drive_for_init,
                             target_position=int(req.get("target")),
                             cfg=cfg,
                             dt_s_fallback=dt_s_fallback,
                             overrides=overrides,
+                            actual_acceleration=acceleration_for_init,
                         )
                     else:
                         trace["request_kind"] = "velocity"
@@ -2714,11 +2733,12 @@ class EtherCATProcess:
                         self._ruckig_planner.start_velocity(
                             pos,
                             actual_position=actual_position,
-                            actual_velocity=actual_velocity_estimated,
+                            actual_velocity=velocity_for_init,
                             target_velocity=float(req.get("target")),
                             cfg=cfg,
                             dt_s_fallback=dt_s_fallback,
                             overrides=overrides,
+                            actual_acceleration=acceleration_for_init,
                         )
 
                     # Seed CSP buffer to measured position to prevent a step on the first cycle.
