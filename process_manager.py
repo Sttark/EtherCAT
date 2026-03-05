@@ -1579,6 +1579,7 @@ class EtherCATProcess:
                     "nip_in_start": int(params.get("nip_in_start") or 0),
                     "nip_out_start": int(params.get("nip_out_start") or 0),
                     "die_counts_per_rev": float(params["die_counts_per_rev"]),
+                    "die_velocity_counts_per_s": float(params.get("die_velocity_counts_per_s") or 0.0),
                     "nip_in_counts_per_rev": float(params.get("nip_in_counts_per_rev") or 0.0),
                     "nip_out_counts_per_rev": float(params.get("nip_out_counts_per_rev") or 0.0),
                     "comp_counts": [int(v) for v in comp_counts],
@@ -2470,7 +2471,7 @@ class EtherCATProcess:
         
         if use_ruckig and ruckig_integrator is not None:
             position, velocity, acceleration = ruckig_integrator.step(target_velocity_counts_per_s)
-            die_commanded = int(die_actual + position)
+            die_commanded = int(die_start + position)
             
             if cycle_count % 500 == 0:
                 print(f"[RT-RUCKIG] cycle={cycle_count}, target_vel={target_velocity_counts_per_s:.1f}, "
@@ -2501,9 +2502,8 @@ class EtherCATProcess:
         
         if cycle_count % 500 == 0:
             print(f"[RT-SEND] pos={die_pos}, csp_target={int(die_commanded)}", flush=True)
-            actual_die_pos = self.position_actual.get(die_pos, 0)
-            error = actual_die_pos - die_commanded
-            print(f"[RT-FEEDBACK] cmd={die_commanded}, actual={actual_die_pos}, error={error}", flush=True)
+            error = die_actual - die_commanded
+            print(f"[RT-FEEDBACK] cmd={die_commanded}, actual={die_actual}, error={error}", flush=True)
         
         die_elapsed = die_actual - die_start
         if abs_counts_per_rev <= 0.0:
@@ -3366,15 +3366,6 @@ class EtherCATProcessManager:
 
     # Application API
     def send_command(self, cmd: Command):
-        if cmd.type == CommandType.START_SEMI_ROTARY_RT:
-            self._start_semi_rotary(cmd.params or {})
-            return True
-        elif cmd.type == CommandType.UPDATE_SEMI_ROTARY_RT:
-            self._update_semi_rotary(cmd.params or {})
-            return True
-        elif cmd.type == CommandType.STOP_SEMI_ROTARY_RT:
-            self._stop_semi_rotary()
-            return True
         try:
             self._cmd_q.put_nowait(cmd)
             return True
