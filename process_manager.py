@@ -2827,6 +2827,7 @@ class EtherCATProcess:
                 acceleration_for_init = actual_acceleration_estimated
 
                 try:
+                    needs_csp_seed = False
                     if req.get("kind") == "position":
                         trace["request_kind"] = "position"
                         trace["request_target_position"] = int(req.get("target"))
@@ -2840,26 +2841,32 @@ class EtherCATProcess:
                             overrides=overrides,
                             actual_acceleration=acceleration_for_init,
                         )
+                        needs_csp_seed = True
                     else:
                         trace["request_kind"] = "velocity"
                         trace["request_target_velocity"] = float(req.get("target"))
                         trace["request_max_velocity"] = params.get("max_velocity")
                         trace["request_max_acceleration"] = params.get("max_acceleration")
                         trace["request_max_jerk"] = params.get("max_jerk")
-                        self._ruckig_planner.start_velocity(
-                            pos,
-                            actual_position=actual_position,
-                            actual_velocity=velocity_for_init,
-                            target_velocity=float(req.get("target")),
-                            cfg=cfg,
-                            dt_s_fallback=dt_s_fallback,
-                            overrides=overrides,
-                            actual_acceleration=acceleration_for_init,
-                        )
+                        if self._ruckig_planner.is_velocity_mode(pos):
+                            self._ruckig_planner.update_target_velocity(pos, float(req.get("target")))
+                            trace["velocity_update_only"] = True
+                        else:
+                            self._ruckig_planner.start_velocity(
+                                pos,
+                                actual_position=actual_position,
+                                actual_velocity=velocity_for_init,
+                                target_velocity=float(req.get("target")),
+                                cfg=cfg,
+                                dt_s_fallback=dt_s_fallback,
+                                overrides=overrides,
+                                actual_acceleration=acceleration_for_init,
+                            )
+                            needs_csp_seed = True
 
-                    # Seed CSP buffer to measured position to prevent a step on the first cycle.
-                    self._csp_target_next[pos] = int(actual_position)
-                    self._csp_target_cur[pos] = int(actual_position)
+                    if needs_csp_seed:
+                        self._csp_target_next[pos] = int(actual_position)
+                        self._csp_target_cur[pos] = int(actual_position)
                     self._ruckig_last_error[pos] = None
                 except (RuckigUnavailable, ValueError) as e:
                     self._ruckig_last_error[pos] = str(e)

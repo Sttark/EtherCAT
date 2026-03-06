@@ -106,6 +106,17 @@ class RuckigCspPlanner:
     def consume_last_error(self, slave_pos: int) -> Optional[str]:
         return self._last_error.pop(slave_pos, None)
 
+    def is_velocity_mode(self, slave_pos: int) -> bool:
+        s = self._state.get(slave_pos)
+        return s is not None and s.get("mode") == "velocity"
+
+    def update_target_velocity(self, slave_pos: int, target_velocity: float) -> bool:
+        s = self._state.get(slave_pos)
+        if s is None or s.get("mode") != "velocity":
+            return False
+        s["target_velocity"] = float(target_velocity)
+        return True
+
     def start_position(
         self,
         slave_pos: int,
