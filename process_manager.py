@@ -1612,8 +1612,6 @@ class EtherCATProcess:
                     "nip_out_integrator": nip_out_integrator,
                     "nip_in_target_velocity": nip_in_target_velocity if nip_in_integrator is not None else 0.0,
                     "nip_out_target_velocity": nip_out_target_velocity if nip_out_integrator is not None else 0.0,
-                    "nip_in_actual": int(params.get("nip_in_start") or 0),
-                    "nip_out_actual": int(params.get("nip_out_start") or 0),
                     "active": True,
                 }
                 self.last_mode_cmd[die_pos] = MODE_CSP
@@ -2702,9 +2700,7 @@ class EtherCATProcess:
             if nip_in_pos is not None and self.drive_enabled.get(nip_in_pos, False) and not self._manual_disable.get(nip_in_pos, False):
                 if nip_in_integrator is not None and rt.get("use_ruckig", False):
                     nip_in_position, nip_in_velocity, nip_in_acceleration = nip_in_integrator.step(nip_in_target_velocity)
-                    nip_in_actual = int(rt.get("nip_in_actual", rt.get("nip_in_start", 0)))
-                    nip_in_target = nip_in_actual + int(nip_in_position)
-                    rt["nip_in_actual"] = int(nip_in_target)
+                    nip_in_target = int(rt.get("nip_in_start", 0)) + int(nip_in_position)
                 else:
                     nip_in_target = int(rt.get("nip_in_start", 0)) + int(rev_count * float(rt.get("nip_in_counts_per_rev", 0.0)))
                 self._csp_target_next[int(nip_in_pos)] = int(nip_in_target)
@@ -2717,9 +2713,7 @@ class EtherCATProcess:
             if nip_out_pos is not None and self.drive_enabled.get(nip_out_pos, False) and not self._manual_disable.get(nip_out_pos, False):
                 if nip_out_integrator is not None and rt.get("use_ruckig", False):
                     nip_out_position, nip_out_velocity, nip_out_acceleration = nip_out_integrator.step(nip_out_target_velocity)
-                    nip_out_actual = int(rt.get("nip_out_actual", rt.get("nip_out_start", 0)))
-                    nip_out_target = nip_out_actual + int(nip_out_position)
-                    rt["nip_out_actual"] = int(nip_out_target)
+                    nip_out_target = int(rt.get("nip_out_start", 0)) + int(nip_out_position)
                 else:
                     nip_out_target = int(rt.get("nip_out_start", 0)) + int(rev_count * float(rt.get("nip_out_counts_per_rev", 0.0)))
                 self._csp_target_next[int(nip_out_pos)] = int(nip_out_target)
