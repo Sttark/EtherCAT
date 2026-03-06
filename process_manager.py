@@ -46,6 +46,7 @@ from .igh_master import (
 )
 from .xml_decoder import decode_esi
 from .ruckig_planner import RuckigCspPlanner, RuckigUnavailable
+from .tracking_corrector import TrackingCorrector
 from . import shm_layout as SHM
 
 
@@ -1570,12 +1571,17 @@ class EtherCATProcess:
                 
                 self._semi_rotary_rt = {
                     "active": True,
+                    "stopping": False,
                     "die_pos": die_pos,
                     "shuttle_pos": shuttle_pos,
                     "nip_in_pos": params.get("nip_in_pos"),
                     "nip_out_pos": params.get("nip_out_pos"),
                     "die_start": int(params["die_start"]),
                     "shuttle_center": int(params["shuttle_center"]),
+                    "tracking_correction_kp": float(params.get("tracking_correction_kp", params.get("tracking_correction_gain", 0.0))),
+                    "tracking_correction_ki": float(params.get("tracking_correction_ki", 0.0)),
+                    "tracking_correction_max": int(params.get("tracking_correction_max", 5000)),
+                    "tracking_correction_integral_limit": int(params.get("tracking_correction_integral_limit", 10000)),
                     "nip_in_start": int(params.get("nip_in_start") or 0),
                     "nip_out_start": int(params.get("nip_out_start") or 0),
                     "die_counts_per_rev": float(params["die_counts_per_rev"]),
@@ -1588,6 +1594,10 @@ class EtherCATProcess:
                     "cycle_count": 0,
                     "max_shuttle_delta_per_cycle": params.get("max_shuttle_delta_per_cycle"),
                     "max_shuttle_excursion": params.get("max_shuttle_excursion"),
+                    "shuttle_phase_lead": float(params.get("shuttle_phase_lead", 0.0)),
+                    "shuttle_velocity_feedforward": float(params.get("shuttle_velocity_feedforward", 0.0)),
+                    "offline_table_lookup": bool(params.get("offline_table_lookup", False)),
+                    "use_integer_phase": bool(params.get("use_integer_phase", False)),
                     "enable_nips": bool(params.get("enable_nips", False)),
                     "error": None,
                     "die_phase_rt": None,
@@ -1608,6 +1618,17 @@ class EtherCATProcess:
                 }
                 self.last_mode_cmd[die_pos] = MODE_CSP
                 self.last_mode_cmd[shuttle_pos] = MODE_CSP
+                kp = float(params.get("tracking_correction_kp", params.get("tracking_correction_gain", 0.0)))
+                ki = float(params.get("tracking_correction_ki", 0.0))
+                if kp > 0 or ki > 0:
+                    self._semi_rotary_rt["tracking_corrector"] = TrackingCorrector(
+                        kp=kp,
+                        ki=ki,
+                        max_correction=int(params.get("tracking_correction_max", 5000)),
+                        integral_limit=int(params.get("tracking_correction_integral_limit", 10000)),
+                    )
+                else:
+                    self._semi_rotary_rt["tracking_corrector"] = None
                 shuttle_center = int(params["shuttle_center"])
                 self._csp_target_next[shuttle_pos] = shuttle_center
                 self._csp_target_cur[shuttle_pos] = shuttle_center
@@ -1634,6 +1655,10 @@ class EtherCATProcess:
                     "blend_cycles",
                     "max_shuttle_delta_per_cycle",
                     "max_shuttle_excursion",
+                    "shuttle_phase_lead",
+                    "shuttle_velocity_feedforward",
+                    "offline_table_lookup",
+                    "use_integer_phase",
                     "enable_nips",
                     "nip_in_counts_per_rev",
                     "nip_out_counts_per_rev",
@@ -1641,8 +1666,31 @@ class EtherCATProcess:
                 ):
                     if key in params:
                         self._semi_rotary_rt[key] = params[key]
+                if "tracking_correction_kp" in params or "tracking_correction_gain" in params:
+                    kp = float(params.get("tracking_correction_kp", params.get("tracking_correction_gain", 0.0)))
+                    self._semi_rotary_rt["tracking_correction_kp"] = kp
+                if "tracking_correction_ki" in params:
+                    self._semi_rotary_rt["tracking_correction_ki"] = float(params["tracking_correction_ki"])
+                if "tracking_correction_max" in params:
+                    self._semi_rotary_rt["tracking_correction_max"] = int(params["tracking_correction_max"])
+                if "tracking_correction_integral_limit" in params:
+                    self._semi_rotary_rt["tracking_correction_integral_limit"] = int(params["tracking_correction_integral_limit"])
+                kp = float(self._semi_rotary_rt.get("tracking_correction_kp", 0.0))
+                ki = float(self._semi_rotary_rt.get("tracking_correction_ki", 0.0))
+                if kp > 0 or ki > 0:
+                    self._semi_rotary_rt["tracking_corrector"] = TrackingCorrector(
+                        kp=kp,
+                        ki=ki,
+                        max_correction=abs(int(self._semi_rotary_rt.get("tracking_correction_max", 5000))),
+                        integral_limit=abs(int(self._semi_rotary_rt.get("tracking_correction_integral_limit", 10000))),
+                    )
+                else:
+                    self._semi_rotary_rt["tracking_corrector"] = None
         elif cmd.type == CommandType.STOP_SEMI_ROTARY_RT:
-            self._semi_rotary_rt["active"] = False
+            if self._semi_rotary_rt.get("active"):
+                self._semi_rotary_rt["stopping"] = True
+                self._semi_rotary_rt["target_velocity_counts_per_s"] = 0.0
+                print("[RT-STOP] Initiating smooth deceleration to zero velocity", flush=True)
         elif cmd.type == CommandType.START_DIE_VELOCITY_TEST:
             params = dict(cmd.params or {})
             try:
@@ -2465,13 +2513,23 @@ class EtherCATProcess:
                 print(f"[RT-INIT] Using linear ramp, target_velocity={target_velocity_counts_per_s:.0f} counts/s", flush=True)
             
             print(f"[RT-INIT] die_actual={die_actual}, die_commanded_position={die_actual}", flush=True)
+            corrector = rt.get("tracking_corrector")
+            if corrector is not None:
+                print(f"[RT-INIT] Tracking correction: kp={corrector.kp} ki={corrector.ki} "
+                      f"max={corrector.max_correction} integral_limit={corrector.integral_limit}", flush=True)
+            phase_lead = float(rt.get("shuttle_phase_lead", 0.0))
+            vel_ff = float(rt.get("shuttle_velocity_feedforward", 0.0))
+            if phase_lead != 0 or vel_ff != 0:
+                print(f"[RT-INIT] Shuttle feedforward: phase_lead={phase_lead} velocity_feedforward={vel_ff}", flush=True)
         
         die_commanded = rt.get("die_commanded_position", die_actual)
         dt_s = float(self.cfg.cycle_time_ms) / 1000.0
         
+        current_velocity = 0.0
         if use_ruckig and ruckig_integrator is not None:
             position, velocity, acceleration = ruckig_integrator.step(target_velocity_counts_per_s)
             die_commanded = int(die_start + position)
+            current_velocity = velocity
             
             if cycle_count % 500 == 0:
                 print(f"[RT-RUCKIG] cycle={cycle_count}, target_vel={target_velocity_counts_per_s:.1f}, "
@@ -2489,12 +2547,19 @@ class EtherCATProcess:
                     die_velocity_counts_per_s += max_change_per_cycle if delta > 0 else -max_change_per_cycle
                 rt["die_velocity_counts_per_s"] = die_velocity_counts_per_s
             
+            current_velocity = die_velocity_counts_per_s
             die_velocity_counts_per_cycle = die_velocity_counts_per_s * dt_s
             die_commanded = int(die_commanded + die_velocity_counts_per_cycle)
             
             if cycle_count % 500 == 0:
                 print(f"[RT-LINEAR] cycle={cycle_count}, vel/s={die_velocity_counts_per_s:.1f}, "
                       f"vel/cyc={die_velocity_counts_per_cycle:.3f}, commanded={die_commanded}", flush=True)
+        
+        if rt.get("stopping") and abs(current_velocity) < 100.0:
+            print(f"[RT-STOP] Deceleration complete, velocity={current_velocity:.1f}, stopping motion", flush=True)
+            rt["active"] = False
+            rt["stopping"] = False
+            return
         
         self._csp_target_next[die_pos] = int(die_commanded)
         self.last_mode_cmd[die_pos] = MODE_CSP
@@ -2511,13 +2576,24 @@ class EtherCATProcess:
             rt["active"] = False
             return
 
-        if counts_per_rev < 0:
-            die_phase = ((-die_elapsed) % abs_counts_per_rev) / abs_counts_per_rev
+        use_integer_phase = rt.get("use_integer_phase", False)
+        cpr = int(round(abs_counts_per_rev))
+        if use_integer_phase and cpr > 0:
+            remainder_int = int(die_elapsed) % cpr
+            if counts_per_rev < 0:
+                remainder_int = (cpr - remainder_int) % cpr
+            die_phase = float(remainder_int) / float(cpr)
+            phase_offset = float(rt.get("phase_offset", 0.0))
+            die_phase = (die_phase + phase_offset) % 1.0
         else:
-            die_phase = (die_elapsed % abs_counts_per_rev) / abs_counts_per_rev
-        
-        phase_offset = float(rt.get("phase_offset", 0.0))
-        die_phase = (die_phase + phase_offset) % 1.0
+            if counts_per_rev < 0:
+                die_phase = ((-die_elapsed) % abs_counts_per_rev) / abs_counts_per_rev
+            else:
+                die_phase = (die_elapsed % abs_counts_per_rev) / abs_counts_per_rev
+            phase_offset = float(rt.get("phase_offset", 0.0))
+            die_phase = (die_phase + phase_offset) % 1.0
+        phase_lead = float(rt.get("shuttle_phase_lead", 0.0))
+        die_phase_lookup = (die_phase + phase_lead) % 1.0
 
         comp_counts = rt.get("comp_counts") or []
         n_samples = int(rt.get("n_samples") or len(comp_counts))
@@ -2528,17 +2604,25 @@ class EtherCATProcess:
             return
         if n_samples > table_len:
             n_samples = table_len
-        phase_idx = die_phase * n_samples
-        i0 = int(phase_idx)
-        if i0 >= n_samples:
-            i0 = n_samples - 1
-        frac = phase_idx - float(i0)
-        i1 = i0 + 1
-        if i1 >= n_samples:
-            i1 = 0
-        v0 = float(comp_counts[i0])
-        v1 = float(comp_counts[i1])
-        comp_raw = int(round(v0 + (v1 - v0) * frac))
+        if use_integer_phase and cpr > 0 and phase_lead == 0:
+            phase_num = remainder_int * n_samples
+            phase_idx = float(phase_num) / float(cpr)
+        else:
+            phase_idx = die_phase_lookup * n_samples
+        if rt.get("offline_table_lookup"):
+            i = int(round(phase_idx)) % n_samples
+            comp_raw = int(comp_counts[i])
+        else:
+            i0 = int(phase_idx)
+            if i0 >= n_samples:
+                i0 = n_samples - 1
+            frac = phase_idx - float(i0)
+            i1 = i0 + 1
+            if i1 >= n_samples:
+                i1 = 0
+            v0 = float(comp_counts[i0])
+            v1 = float(comp_counts[i1])
+            comp_raw = int(round(v0 + (v1 - v0) * frac))
 
         cycle_count = int(rt.get("cycle_count", 0))
         blend_cycles = int(rt.get("blend_cycles", 0))
@@ -2546,6 +2630,21 @@ class EtherCATProcess:
 
         shuttle_center = int(rt.get("shuttle_center", 0))
         comp_target = shuttle_center + int(comp_raw * blend)
+        velocity_ff_gain = float(rt.get("shuttle_velocity_feedforward", 0.0))
+        if velocity_ff_gain != 0 and n_samples >= 3:
+            ii0 = int(die_phase_lookup * n_samples) % n_samples
+            ii_next = (ii0 + 1) % n_samples
+            ii_prev = (ii0 - 1) % n_samples
+            dphase = 2.0 / n_samples
+            dcomp_dphase = (float(comp_counts[ii_next]) - float(comp_counts[ii_prev])) / dphase
+            die_vel = float(rt.get("die_velocity_counts_per_s") or 0.0)
+            if die_vel != 0 and abs_counts_per_rev > 0:
+                die_phase_rate = die_vel / abs_counts_per_rev
+                target_vel_counts_per_s = dcomp_dphase * die_phase_rate
+                dt_s = float(self.cfg.cycle_time_ms) / 1000.0
+                ff_counts = int(round(velocity_ff_gain * target_vel_counts_per_s))
+                comp_target = int(comp_target) + ff_counts
+        comp_target = int(comp_target)
 
         max_excursion = rt.get("max_shuttle_excursion")
         if max_excursion is not None:
@@ -2556,6 +2655,22 @@ class EtherCATProcess:
                 comp_target = lo
             elif comp_target > hi:
                 comp_target = hi
+
+        shuttle_actual = None
+        shuttle_entries = self.offsets.get(shuttle_pos, {})
+        if (POSITION_ACTUAL_INDEX, 0) in shuttle_entries:
+            raw_s = self.master.read_domain(self.domain, shuttle_entries[(POSITION_ACTUAL_INDEX, 0)], 4)
+            if raw_s:
+                shuttle_actual = int.from_bytes(raw_s, "little", signed=True)
+        corrector = rt.get("tracking_corrector")
+        if corrector is not None and shuttle_actual is not None:
+            dt_s = float(self.cfg.cycle_time_ms) / 1000.0
+            comp_target = corrector.step(int(comp_target), shuttle_actual, dt_s)
+            if max_excursion is not None:
+                max_exc = abs(int(max_excursion))
+                lo = shuttle_center - max_exc
+                hi = shuttle_center + max_exc
+                comp_target = max(lo, min(hi, comp_target))
 
         prev_target = rt.get("comp_target_rt")
         target_delta = None
@@ -2571,6 +2686,13 @@ class EtherCATProcess:
         rev_count = die_elapsed / counts_per_rev
         self._csp_target_next[shuttle_pos] = int(comp_target)
         self.last_mode_cmd[shuttle_pos] = MODE_CSP
+
+        last_logged_rev = int(rt.get("last_logged_rev", -1))
+        rev_int = int(rev_count)
+        if rev_int > last_logged_rev and rev_int >= 0:
+            rt["last_logged_rev"] = rev_int
+            print(f"[RT-PER-REV] rev={rev_int} die_elapsed={die_elapsed} die_phase={die_phase:.6f} "
+                  f"comp_target={comp_target} comp_raw={comp_raw} shuttle_actual={shuttle_actual}", flush=True)
 
         if bool(rt.get("enable_nips", False)):
             nip_in_pos = rt.get("nip_in_pos")
@@ -3251,9 +3373,6 @@ class EtherCATProcessManager:
         self._latest_status: Optional[NetworkStatus] = None
         self._actuals_shm = mp.Array('l', SHM.ACTUALS_SIZE, lock=False)
         self._targets_shm = mp.Array('l', SHM.TARGETS_SIZE, lock=False)
-        self._semi_rotary_proc: Optional[mp.Process] = None
-        self._semi_rotary_stop: Optional[mp.Event] = None
-        self._semi_rotary_cfg_shm = mp.Array('l', 8192, lock=False)
 
     def start(self):
         if self._proc and self._proc.is_alive():
@@ -3275,7 +3394,6 @@ class EtherCATProcessManager:
         return self._proc.exitcode
 
     def stop(self):
-        self._stop_semi_rotary()
         if not self._proc:
             return
         if not self._proc.is_alive():
@@ -3294,75 +3412,6 @@ class EtherCATProcessManager:
             self._proc.join(timeout=2.0)
         self._proc = None
         logger.info("EtherCAT process stopped")
-
-    def _start_semi_rotary(self, params: dict) -> None:
-        self._stop_semi_rotary()
-        from .semi_rotary_process import _semi_rotary_loop
-        comp_counts = params.get("comp_counts") or []
-        n_samples = int(params.get("n_samples") or len(comp_counts))
-        cfg = self._semi_rotary_cfg_shm
-        cfg[0] = 0
-        cfg[1] = 1  # START
-        cfg[2] = int(params["die_pos"])
-        cfg[3] = int(params["shuttle_pos"])
-        cfg[4] = int(params["nip_in_pos"]) if params.get("nip_in_pos") is not None else -1
-        cfg[5] = int(params["nip_out_pos"]) if params.get("nip_out_pos") is not None else -1
-        cfg[6] = int(params["die_start"])
-        cfg[7] = int(params["die_counts_per_rev"])
-        cfg[8] = int(params["shuttle_center"])
-        cfg[9] = int(params.get("blend_cycles") or 0)
-        cfg[10] = int(params.get("max_shuttle_excursion") or 0)
-        cfg[11] = int(params.get("max_shuttle_delta_per_cycle") or 0)
-        cfg[12] = 1 if params.get("enable_nips") else 0
-        cfg[13] = int(params.get("nip_in_counts_per_rev") or 0)
-        cfg[14] = int(params.get("nip_out_counts_per_rev") or 0)
-        cfg[15] = int(params.get("nip_in_start") or 0)
-        cfg[16] = int(params.get("nip_out_start") or 0)
-        cfg[17] = n_samples
-        for i, v in enumerate(comp_counts[:n_samples]):
-            cfg[64 + i] = int(v)
-        self._semi_rotary_stop = mp.Event()
-        cfg[0] = 1  # signal config ready
-        self._semi_rotary_proc = mp.Process(
-            target=_semi_rotary_loop,
-            args=(self._actuals_shm, self._targets_shm, cfg, self._semi_rotary_stop, self.cfg.cycle_time_ms),
-            daemon=True,
-        )
-        self._semi_rotary_proc.start()
-        logger.info("Semi-rotary cam process started")
-
-    def _update_semi_rotary(self, params: dict) -> None:
-        if self._semi_rotary_proc is None or not self._semi_rotary_proc.is_alive():
-            return
-        cfg = self._semi_rotary_cfg_shm
-        comp_counts = params.get("comp_counts") or []
-        n_samples = int(params.get("n_samples") or len(comp_counts))
-        cfg[1] = 2  # UPDATE
-        cfg[9] = int(params.get("blend_cycles") or 0)
-        cfg[10] = int(params.get("max_shuttle_excursion") or 0)
-        cfg[11] = int(params.get("max_shuttle_delta_per_cycle") or 0)
-        cfg[12] = 1 if params.get("enable_nips") else 0
-        cfg[13] = int(params.get("nip_in_counts_per_rev") or 0)
-        cfg[14] = int(params.get("nip_out_counts_per_rev") or 0)
-        cfg[17] = n_samples
-        for i, v in enumerate(comp_counts[:n_samples]):
-            cfg[64 + i] = int(v)
-        cfg[0] += 1  # bump sequence to signal update
-
-    def _stop_semi_rotary(self) -> None:
-        if self._semi_rotary_proc is not None:
-            cfg = self._semi_rotary_cfg_shm
-            cfg[1] = 0  # STOP
-            cfg[0] += 1
-            if self._semi_rotary_stop is not None:
-                self._semi_rotary_stop.set()
-            self._semi_rotary_proc.join(timeout=2.0)
-            if self._semi_rotary_proc.is_alive():
-                self._semi_rotary_proc.terminate()
-                self._semi_rotary_proc.join(timeout=1.0)
-            self._semi_rotary_proc = None
-            self._semi_rotary_stop = None
-            logger.info("Semi-rotary cam process stopped")
 
     # Application API
     def send_command(self, cmd: Command):
