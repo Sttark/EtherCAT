@@ -775,6 +775,7 @@ class EtherCATProcess:
         self._die_test_target_rpm = 0.0
         self._die_test_target_velocity = 0.0
         self._die_test_pos = 0
+        self._die_velocity_test_first_cycle = True
         
         raw_process_log_file = getattr(self.cfg, "process_log_file", None)
         if raw_process_log_file is None:
@@ -1686,9 +1687,21 @@ class EtherCATProcess:
                     self._semi_rotary_rt["tracking_corrector"] = None
         elif cmd.type == CommandType.STOP_SEMI_ROTARY_RT:
             if self._semi_rotary_rt.get("active"):
-                self._semi_rotary_rt["stopping"] = True
-                self._semi_rotary_rt["target_velocity_counts_per_s"] = 0.0
-                print("[RT-STOP] Initiating smooth deceleration to zero velocity", flush=True)
+                die_pos = self._semi_rotary_rt.get("die_pos")
+                shuttle_pos = self._semi_rotary_rt.get("shuttle_pos")
+                die_enabled = self.drive_enabled.get(die_pos, False) and not self._manual_disable.get(die_pos, False)
+                shuttle_enabled = self.drive_enabled.get(shuttle_pos, False) and not self._manual_disable.get(shuttle_pos, False)
+                if die_enabled and shuttle_enabled:
+                    self._semi_rotary_rt["stopping"] = True
+                    self._semi_rotary_rt["die_velocity_counts_per_s"] = 0.0
+                    self._semi_rotary_rt["target_velocity_counts_per_s"] = 0.0
+                    print("[RT-STOP] Initiating smooth deceleration to zero velocity", flush=True)
+                else:
+                    self._semi_rotary_rt["active"] = False
+                    self._semi_rotary_rt["stopping"] = False
+                    self._semi_rotary_rt["die_velocity_counts_per_s"] = 0.0
+                    self._semi_rotary_rt["cycle_count"] = 0
+                    print("[RT-STOP] Force-stopped RT (drives not enabled)", flush=True)
         elif cmd.type == CommandType.START_DIE_VELOCITY_TEST:
             params = dict(cmd.params or {})
             try:
@@ -1734,6 +1747,7 @@ class EtherCATProcess:
                 self._die_test_target_velocity = target_velocity
                 self._die_test_pos = die_pos
                 self._die_velocity_test_active = True
+                self._die_velocity_test_first_cycle = True
                 
                 self.last_mode_cmd[die_pos] = MODE_CSP
                 
@@ -1779,6 +1793,22 @@ class EtherCATProcess:
             self._pv_pulse_active[cmd.target_id] = False
             self._pv_pulse_start_ns[cmd.target_id] = None
             self._pv_pulse_pending[cmd.target_id] = False
+            # Clear CSP targets so re-enable seeds with fresh actual position
+            self._csp_target_cur.pop(cmd.target_id, None)
+            self._csp_target_next.pop(cmd.target_id, None)
+            # Stop semi_rotary_rt if this is the die or shuttle being disabled
+            rt = self._semi_rotary_rt
+            if rt.get("active"):
+                die_pos = rt.get("die_pos")
+                shuttle_pos = rt.get("shuttle_pos")
+                if cmd.target_id in (die_pos, shuttle_pos):
+                    rt["active"] = False
+                    rt["stopping"] = False
+                    rt["die_velocity_counts_per_s"] = 0.0
+                    rt["cycle_count"] = 0
+                    self._emit_process_log(
+                        f"[EC][RT] semi_rotary_rt deactivated due to drive {cmd.target_id} disable"
+                    )
         elif cmd.type == CommandType.WRITE_RAW_PDO:
             pos = cmd.target_id
             key = (cmd.params["index"], cmd.params["subindex"])
@@ -1895,6 +1925,16 @@ class EtherCATProcess:
             
             # Switched On: xxxx xxxx x01x 0011
             elif state_bits == 0x0023:
+                # Seed CSP target with actual position BEFORE enabling to prevent jump
+                if slave_pos not in self._csp_target_cur:
+                    if (POSITION_ACTUAL_INDEX, 0) in entries:
+                        raw_p = self.master.read_domain(self.domain, entries[(POSITION_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                        actual_pos = int.from_bytes(raw_p, "little", signed=True)
+                        self._csp_target_cur[slave_pos] = actual_pos
+                        self._csp_target_next[slave_pos] = actual_pos
+                        self._emit_process_log(
+                            f"[EC][CIA402] slave={slave_pos} seeded CSP target={actual_pos} before enable"
+                        )
                 # Send ENABLE_OPERATION (0x000F)
                 self.desired_controlword[slave_pos] = 0x000F
                 self.enable_last_action_ns[slave_pos] = now_ns
@@ -2444,9 +2484,18 @@ class EtherCATProcess:
             return
         
         try:
-            position, velocity, acceleration = self._die_velocity_integrator.step(
-                self._die_test_target_velocity
-            )
+            if self._die_velocity_test_first_cycle:
+                entries = self.offsets.get(die_pos, {})
+                if (POSITION_ACTUAL_INDEX, 0) in entries:
+                    raw_p = self.master.read_domain(self.domain, entries[(POSITION_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                    position = int.from_bytes(raw_p, "little", signed=True)
+                else:
+                    position = int(round(self._die_velocity_integrator.position))
+                self._die_velocity_test_first_cycle = False
+            else:
+                position, velocity, acceleration = self._die_velocity_integrator.step(
+                    self._die_test_target_velocity
+                )
             
             self._csp_target_next[die_pos] = int(round(position))
         except Exception as e:
@@ -2504,8 +2553,49 @@ class EtherCATProcess:
             rt["target_velocity_counts_per_s"] = target_velocity_counts_per_s
             
             if use_ruckig and ruckig_integrator is not None:
-                ruckig_integrator.reset(position=0.0, velocity=0.0, acceleration=0.0)
-                print(f"[RT-INIT] Using Ruckig velocity interface, target_velocity={target_velocity_counts_per_s:.0f} counts/s", flush=True)
+                die_start = int(rt.get("die_start", 0))
+                current_pos = float(die_actual - die_start)
+                current_vel = 0.0
+                if (VELOCITY_ACTUAL_INDEX, 0) in die_entries:
+                    raw_v = self.master.read_domain(self.domain, die_entries[(VELOCITY_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                    current_vel = float(int.from_bytes(raw_v, "little", signed=True))
+                ruckig_integrator.reset(position=current_pos, velocity=current_vel, acceleration=0.0)
+                print(f"[RT-INIT] Die integrator reset, pos={current_pos:.0f}, vel={current_vel:.0f}, target_vel={target_velocity_counts_per_s:.0f}", flush=True)
+                
+                nip_in_integrator = rt.get("nip_in_integrator")
+                nip_out_integrator = rt.get("nip_out_integrator")
+                nip_in_pos = rt.get("nip_in_pos")
+                nip_out_pos = rt.get("nip_out_pos")
+                
+                if nip_in_integrator is not None and nip_in_pos is not None:
+                    nip_in_entries = self.offsets.get(nip_in_pos, {})
+                    nip_in_start = int(rt.get("nip_in_start", 0))
+                    nip_in_actual = 0
+                    if (POSITION_ACTUAL_INDEX, 0) in nip_in_entries:
+                        raw_p = self.master.read_domain(self.domain, nip_in_entries[(POSITION_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                        nip_in_actual = int.from_bytes(raw_p, "little", signed=True)
+                    nip_in_pos_rel = float(nip_in_actual - nip_in_start)
+                    nip_in_vel = 0.0
+                    if (VELOCITY_ACTUAL_INDEX, 0) in nip_in_entries:
+                        raw_v = self.master.read_domain(self.domain, nip_in_entries[(VELOCITY_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                        nip_in_vel = float(int.from_bytes(raw_v, "little", signed=True))
+                    nip_in_integrator.reset(position=nip_in_pos_rel, velocity=nip_in_vel, acceleration=0.0)
+                    print(f"[RT-INIT] Nip in integrator reset, pos={nip_in_pos_rel:.0f}, vel={nip_in_vel:.0f}", flush=True)
+                
+                if nip_out_integrator is not None and nip_out_pos is not None:
+                    nip_out_entries = self.offsets.get(nip_out_pos, {})
+                    nip_out_start = int(rt.get("nip_out_start", 0))
+                    nip_out_actual = 0
+                    if (POSITION_ACTUAL_INDEX, 0) in nip_out_entries:
+                        raw_p = self.master.read_domain(self.domain, nip_out_entries[(POSITION_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                        nip_out_actual = int.from_bytes(raw_p, "little", signed=True)
+                    nip_out_pos_rel = float(nip_out_actual - nip_out_start)
+                    nip_out_vel = 0.0
+                    if (VELOCITY_ACTUAL_INDEX, 0) in nip_out_entries:
+                        raw_v = self.master.read_domain(self.domain, nip_out_entries[(VELOCITY_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                        nip_out_vel = float(int.from_bytes(raw_v, "little", signed=True))
+                    nip_out_integrator.reset(position=nip_out_pos_rel, velocity=nip_out_vel, acceleration=0.0)
+                    print(f"[RT-INIT] Nip out integrator reset, pos={nip_out_pos_rel:.0f}, vel={nip_out_vel:.0f}", flush=True)
             else:
                 rt["die_velocity_counts_per_s"] = 0.0
                 print(f"[RT-INIT] Using linear ramp, target_velocity={target_velocity_counts_per_s:.0f} counts/s", flush=True)
@@ -2525,13 +2615,17 @@ class EtherCATProcess:
         
         current_velocity = 0.0
         if use_ruckig and ruckig_integrator is not None:
-            position, velocity, acceleration = ruckig_integrator.step(target_velocity_counts_per_s)
-            die_commanded = int(die_start + position)
-            current_velocity = velocity
+            if cycle_count == 0:
+                die_commanded = die_actual
+                current_velocity = ruckig_integrator.inp.current_velocity[0]
+            else:
+                position, velocity, acceleration = ruckig_integrator.step(target_velocity_counts_per_s)
+                die_commanded = int(die_start + position)
+                current_velocity = velocity
             
             if cycle_count % 500 == 0:
                 print(f"[RT-RUCKIG] cycle={cycle_count}, target_vel={target_velocity_counts_per_s:.1f}, "
-                      f"current_vel={velocity:.1f}, acc={acceleration:.1f}, commanded={die_commanded}", flush=True)
+                      f"current_vel={current_velocity:.1f}, commanded={die_commanded}", flush=True)
         else:
             die_velocity_counts_per_s = rt.get("die_velocity_counts_per_s", 0.0)
             
@@ -2699,8 +2793,16 @@ class EtherCATProcess:
             
             if nip_in_pos is not None and self.drive_enabled.get(nip_in_pos, False) and not self._manual_disable.get(nip_in_pos, False):
                 if nip_in_integrator is not None and rt.get("use_ruckig", False):
-                    nip_in_position, nip_in_velocity, nip_in_acceleration = nip_in_integrator.step(nip_in_target_velocity)
-                    nip_in_target = int(rt.get("nip_in_start", 0)) + int(nip_in_position)
+                    if cycle_count == 0:
+                        nip_in_entries = self.offsets.get(nip_in_pos, {})
+                        if (POSITION_ACTUAL_INDEX, 0) in nip_in_entries:
+                            raw_p = self.master.read_domain(self.domain, nip_in_entries[(POSITION_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                            nip_in_target = int.from_bytes(raw_p, "little", signed=True)
+                        else:
+                            nip_in_target = int(rt.get("nip_in_start", 0))
+                    else:
+                        nip_in_position, nip_in_velocity, nip_in_acceleration = nip_in_integrator.step(nip_in_target_velocity)
+                        nip_in_target = int(rt.get("nip_in_start", 0)) + int(nip_in_position)
                 else:
                     nip_in_target = int(rt.get("nip_in_start", 0)) + int(rev_count * float(rt.get("nip_in_counts_per_rev", 0.0)))
                 self._csp_target_next[int(nip_in_pos)] = int(nip_in_target)
@@ -2712,8 +2814,16 @@ class EtherCATProcess:
             
             if nip_out_pos is not None and self.drive_enabled.get(nip_out_pos, False) and not self._manual_disable.get(nip_out_pos, False):
                 if nip_out_integrator is not None and rt.get("use_ruckig", False):
-                    nip_out_position, nip_out_velocity, nip_out_acceleration = nip_out_integrator.step(nip_out_target_velocity)
-                    nip_out_target = int(rt.get("nip_out_start", 0)) + int(nip_out_position)
+                    if cycle_count == 0:
+                        nip_out_entries = self.offsets.get(nip_out_pos, {})
+                        if (POSITION_ACTUAL_INDEX, 0) in nip_out_entries:
+                            raw_p = self.master.read_domain(self.domain, nip_out_entries[(POSITION_ACTUAL_INDEX, 0)], 4) or b"\x00\x00\x00\x00"
+                            nip_out_target = int.from_bytes(raw_p, "little", signed=True)
+                        else:
+                            nip_out_target = int(rt.get("nip_out_start", 0))
+                    else:
+                        nip_out_position, nip_out_velocity, nip_out_acceleration = nip_out_integrator.step(nip_out_target_velocity)
+                        nip_out_target = int(rt.get("nip_out_start", 0)) + int(nip_out_position)
                 else:
                     nip_out_target = int(rt.get("nip_out_start", 0)) + int(rev_count * float(rt.get("nip_out_counts_per_rev", 0.0)))
                 self._csp_target_next[int(nip_out_pos)] = int(nip_out_target)
@@ -2799,6 +2909,7 @@ class EtherCATProcess:
             trace["cycle_idx"] = int(self.cycle_count)
 
             # Start request (initialize planner using measured actuals)
+            needs_csp_seed = False
             req = self._ruckig_requests.get(pos)
             if req is not None:
                 cfg = getattr(dcfg, "ruckig", None)
@@ -2867,6 +2978,7 @@ class EtherCATProcess:
                     if needs_csp_seed:
                         self._csp_target_next[pos] = int(actual_position)
                         self._csp_target_cur[pos] = int(actual_position)
+                        trace["first_cycle_seed"] = True
                     self._ruckig_last_error[pos] = None
                 except (RuckigUnavailable, ValueError) as e:
                     self._ruckig_last_error[pos] = str(e)
@@ -2874,7 +2986,9 @@ class EtherCATProcess:
                 finally:
                     self._ruckig_requests.pop(pos, None)
 
-            # Step active planner
+            if needs_csp_seed:
+                continue
+
             step = self._ruckig_planner.step(pos, actual_position=actual_position, actual_velocity=actual_velocity_drive)
             if step is not None:
                 csp_target = _wrap_i32(int(step.position))
