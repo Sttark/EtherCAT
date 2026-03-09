@@ -14,7 +14,9 @@ __all__ = [
     "commands",
     "status_model",
     "igh_master",
+    "process_manager",
     "ruckig_planner",
+    "xml_decoder",
 ]
 
 __version__ = "0.1.0"
