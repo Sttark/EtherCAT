@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sttark-ethercat"
+version = "0.1.0"
+requires-python = ">=3.9"
+license = {text = "Proprietary"}
+authors = [
+    {name = "Sttark Team"},
+]
+dependencies = []
+
+[project.optional-dependencies]
+ruckig = ["ruckig"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sttark_ethercat", "sttark_ethercat.*"]
